@@ -6,7 +6,6 @@ package usbhid
 
 import (
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -20,53 +19,30 @@ type deviceExtra struct {
 	file *os.File
 }
 
+const (
+	iocNrShift   = 0
+	iocTypeShift = 8
+	iocSizeShift = 16
+)
+
 var (
 	iocWrite    byte
 	iocRead     byte
 	iocSizeBits byte
 	iocDirBits  byte
 
-	iocNrShift   byte
-	iocTypeShift byte
-	iocSizeShift byte
-	iocDirShift  byte
+	iocDirShift byte
 )
 
 func init() {
 	switch runtime.GOARCH {
-	case "386":
-		fallthrough
-	case "amd64":
-		fallthrough
-	case "arm":
-		fallthrough
-	case "arm64":
-		fallthrough
-	case "loong64":
-		fallthrough
-	case "riscv64":
-		fallthrough
-	case "s390x":
+	case "386", "amd64", "arm", "arm64", "loong64", "riscv64", "s390x":
 		iocWrite = 1
 		iocRead = 2
 		iocSizeBits = 14
 		iocDirBits = 2
 
-	case "mips":
-		fallthrough
-	case "mips64":
-		fallthrough
-	case "mips64le":
-		fallthrough
-	case "mipsle":
-		fallthrough
-	case "ppc":
-		fallthrough
-	case "ppc64":
-		fallthrough
-	case "ppc64le":
-		fallthrough
-	case "sparc64":
+	case "mips", "mips64", "mips64le", "mipsle", "ppc", "ppc64", "ppc64le", "sparc64":
 		iocWrite = 4
 		iocRead = 2
 		iocSizeBits = 13
@@ -76,15 +52,12 @@ func init() {
 		panic("usbhid: unsupported architecture")
 	}
 
-	iocNrShift = 0
-	iocTypeShift = 8
-	iocSizeShift = 16
-	iocDirShift = 16 + iocSizeBits
+	iocDirShift = iocSizeShift + iocSizeBits
 }
 
 func ioc(dir byte, typ byte, nr byte, size uint16) uint32 {
-	dir = dir & (byte(math.Pow(2, float64(iocDirBits))) - 1)
-	size = size & (uint16(math.Pow(2, float64(iocSizeBits))) - 1)
+	dir = dir & (1<<iocDirBits - 1)
+	size = size & (1<<iocSizeBits - 1)
 	return uint32(dir)<<iocDirShift | uint32(typ)<<iocTypeShift | uint32(nr)<<iocNrShift | uint32(size)<<iocSizeShift
 }
 
@@ -124,12 +97,22 @@ func sysfsReadAsHexUint16(dir string, entry string) (uint16, error) {
 func enumerate() ([]*Device, error) {
 	rv := []*Device{}
 
-	if err := filepath.Walk("/sys/bus/usb/devices", func(path string, info os.FileInfo, err error) error {
+	root := "/sys/bus/usb/devices"
+	if err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return err
+			// a single unreadable entry must not abort the enumeration.
+			if path == root {
+				return err
+			}
+			return nil
 		}
 
 		if info.Mode()&os.ModeSymlink == 0 || strings.Contains(info.Name(), ":") {
+			return nil
+		}
+
+		files, err := filepath.Glob(filepath.Join(path, "[0-9]*", "[0-9]*", "hidraw", "hidraw[0-9]*"))
+		if err != nil || len(files) == 0 {
 			return nil
 		}
 
@@ -161,11 +144,6 @@ func enumerate() ([]*Device, error) {
 		var serialNumber string
 		if s, err := sysfsReadAsString(path, "serial"); err == nil {
 			serialNumber = s
-		}
-
-		files, err := filepath.Glob(filepath.Join(path, "[0-9]*", "[0-9]*", "hidraw", "hidraw[0-9]*"))
-		if err != nil {
-			return nil
 		}
 
 		for _, f := range files {
@@ -269,12 +247,12 @@ func (d *Device) getFeatureReport(reportId byte) ([]byte, error) {
 		return nil, err
 	}
 
-	start := 0
-	if d.reportWithId {
-		start++
-		rv--
+	// hidraw always stores the report number in the first byte and counts it
+	// in the returned length, even for descriptors without report ids.
+	if rv < 1 || rv > len(buf) {
+		return nil, fmt.Errorf("invalid report length: %d", rv)
 	}
-	return buf[start : start+rv], nil
+	return buf[1:rv], nil
 }
 
 func (d *Device) setFeatureReport(reportId byte, data []byte) error {

@@ -173,9 +173,9 @@ func (d *Device) GetInputReport() (byte, []byte, error) {
 
 // SetOutputReport writes an output report to the USB HID device.
 // It takes the report id and a slice of bytes with the data to be sent,
-// and returns an error or nil. If the size of the slice is lower than
-// the expected report size, it will be zero padded, and if it is bigger,
-// an error is returned.
+// and returns an error or nil. If the slice is bigger than the expected
+// report size, an error is returned. Any padding required by the operating
+// system is handled internally.
 func (d *Device) SetOutputReport(reportId byte, data []byte) error {
 	if !d.isOpen() {
 		return fmt.Errorf("%w [%s]", ErrDeviceIsClosed, d)
@@ -207,11 +207,11 @@ func (d *Device) GetFeatureReport(reportId byte) ([]byte, error) {
 	return buf, nil
 }
 
-// SetFeatureReport writes an output report to the USB HID device.
+// SetFeatureReport writes a feature report to the USB HID device.
 // It takes the report id and a slice of bytes with the data to be sent,
-// and returns an error or nil. If the size of the slice is lower than
-// the expected report size, it will be zero padded, and if it is bigger,
-// an error is returned.
+// and returns an error or nil. If the slice is bigger than the expected
+// report size, an error is returned. Any padding required by the operating
+// system is handled internally.
 func (d *Device) SetFeatureReport(reportId byte, data []byte) error {
 	if !d.isOpen() {
 		return fmt.Errorf("%w [%s]", ErrDeviceIsClosed, d)

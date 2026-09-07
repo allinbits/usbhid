@@ -116,6 +116,62 @@ var (
 		0xC0, // EndCollection()
 	}
 
+	bPushPop = []byte{
+		0x05, 0x01, // UsagePage(Generic Desktop[0x0001])
+		0x09, 0x06, // UsageId(Keyboard[0x0006])
+		0xA1, 0x01, // Collection(Application)
+		0x75, 0x08, //     ReportSize(8)
+		0x95, 0x04, //     ReportCount(4)
+		0xA4,       //     Push()
+		0x75, 0x01, //     ReportSize(1)
+		0x95, 0x08, //     ReportCount(8)
+		0x81, 0x02, //     Input(Data, Variable, Absolute, NoWrap, Linear, PreferredState, NoNullPosition, BitField)
+		0xB4,       //     Pop()
+		0x81, 0x02, //     Input(Data, Variable, Absolute, NoWrap, Linear, PreferredState, NoNullPosition, BitField)
+		0xC0, // EndCollection()
+	}
+
+	bMultiTLC = []byte{
+		0x05, 0x01, // UsagePage(Generic Desktop[0x0001])
+		0x09, 0x06, // UsageId(Keyboard[0x0006])
+		0xA1, 0x01, // Collection(Application)
+		0x85, 0x01, //     ReportId(1)
+		0x95, 0x08, //     ReportCount(8)
+		0x75, 0x01, //     ReportSize(1)
+		0x81, 0x02, //     Input(Data, Variable, Absolute, NoWrap, Linear, PreferredState, NoNullPosition, BitField)
+		0xC0,       // EndCollection()
+		0x05, 0x0C, // UsagePage(Consumer[0x000C])
+		0x09, 0x01, // UsageId(Consumer Control[0x0001])
+		0xA1, 0x01, // Collection(Application)
+		0x85, 0x02, //     ReportId(2)
+		0x95, 0x01, //     ReportCount(1)
+		0x75, 0x10, //     ReportSize(16)
+		0x81, 0x00, //     Input(Data, Array, Absolute, NoWrap, Linear, PreferredState, NoNullPosition, BitField)
+		0xC0, // EndCollection()
+	}
+
+	bTruncated = []byte{
+		0x05, 0x01, // UsagePage(Generic Desktop[0x0001])
+		0x09, 0x06, // UsageId(Keyboard[0x0006])
+		0xA1, 0x01, // Collection(Application)
+		0x95, 0x08, //     ReportCount(8)
+		0x75, 0x01, //     ReportSize(1)
+		0x81, 0x02, //     Input(Data, Variable, Absolute, NoWrap, Linear, PreferredState, NoNullPosition, BitField)
+		0xC0, // EndCollection()
+		0x85, // ReportId(), truncated
+	}
+
+	bLongItem = []byte{
+		0x05, 0x01, // UsagePage(Generic Desktop[0x0001])
+		0x09, 0x06, // UsageId(Keyboard[0x0006])
+		0xA1, 0x01, // Collection(Application)
+		0x95, 0x01, //     ReportCount(1)
+		0x75, 0x08, //     ReportSize(8)
+		0xFE, 0x02, 0x01, 0x81, 0x02, //     LongItem(0x01), payload looks like Input()
+		0x81, 0x02, //     Input(Data, Variable, Absolute, NoWrap, Linear, PreferredState, NoNullPosition, BitField)
+		0xC0, // EndCollection()
+	}
+
 	args = []struct {
 		descr      []byte
 		rusagePage uint16
@@ -127,6 +183,10 @@ var (
 	}{
 		{b8, 0x000C, 0x0001, 1, 1, 0, true},
 		{b8Mega, 0x000C, 0x0001, 1, 23, 2, true},
+		{bPushPop, 0x0001, 0x0006, 5, 0, 0, false},
+		{bMultiTLC, 0x0001, 0x0006, 2, 0, 0, true},
+		{bTruncated, 0x0001, 0x0006, 1, 0, 0, false},
+		{bLongItem, 0x0001, 0x0006, 1, 0, 0, false},
 	}
 )
 

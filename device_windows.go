@@ -5,18 +5,16 @@
 package usbhid
 
 import (
-	"crypto/sha1"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
-	"path"
+	"runtime"
 	"syscall"
 	"unsafe"
 )
 
 type overlapped struct {
 	n   uint32
+	ev  uintptr
 	ovl struct {
 		internal     uintptr
 		internalHigh uintptr
@@ -72,9 +70,11 @@ type _HIDP_CAPS struct {
 }
 
 type deviceExtra struct {
-	file      uintptr
-	flock     uintptr
-	flockPath string
+	file         uintptr
+	evInput      uintptr
+	evOutput     uintptr
+	evGetFeature uintptr
+	evSetFeature uintptr
 }
 
 const (
@@ -90,14 +90,11 @@ const (
 	_FILE_SHARE_READ  uint32 = 0x00000001
 	_FILE_SHARE_WRITE uint32 = 0x00000002
 
-	_LOCKFILE_FAIL_IMMEDIATELY uint32 = 0x00000001
-	_LOCKFILE_EXCLUSIVE_LOCK   uint32 = 0x00000002
-
 	_IOCTL_HID_SET_FEATURE uint32 = 0x000b0191
 	_IOCTL_HID_GET_FEATURE uint32 = 0x000b0192
 
 	_ERROR_SUCCESS             syscall.Errno = 0x00000000
-	_ERROR_LOCK_VIOLATION      syscall.Errno = 0x00000021
+	_ERROR_SHARING_VIOLATION   syscall.Errno = 0x00000020
 	_ERROR_INSUFFICIENT_BUFFER syscall.Errno = 0x0000007a
 	_ERROR_IO_PENDING          syscall.Errno = 0x000003e5
 )
@@ -109,7 +106,6 @@ var (
 	_CloseHandle         = kernel32.NewProc("CloseHandle")
 	_DeviceIoControl     = kernel32.NewProc("DeviceIoControl")
 	_GetOverlappedResult = kernel32.NewProc("GetOverlappedResult")
-	_LockFileEx          = kernel32.NewProc("LockFileEx")
 	_ReadFile            = kernel32.NewProc("ReadFile")
 	_WriteFile           = kernel32.NewProc("WriteFile")
 )
@@ -143,28 +139,50 @@ var (
 	_HidP_GetCaps               = hid.NewProc("HidP_GetCaps")
 )
 
+func errnoIs(err error, e syscall.Errno) bool {
+	errno, match := err.(syscall.Errno)
+	return match && errno == e
+}
+
+func callError(err error, accept ...syscall.Errno) error {
+	errno, match := err.(syscall.Errno)
+	if !match {
+		return err
+	}
+	if errno == _ERROR_SUCCESS {
+		return nil
+	}
+	for _, a := range accept {
+		if errno == a {
+			return nil
+		}
+	}
+	return errno
+}
+
 func call(p *syscall.LazyProc, args ...any) (uintptr, error) {
+	// the pointers are converted to uintptr outside of the Call expression, so
+	// nothing else keeps them reachable while the kernel is using them.
+	defer runtime.KeepAlive(args)
+
 	var ovl *overlapped
 
 	v := make([]uintptr, len(args))
 	for i, arg := range args {
 		switch arg := arg.(type) {
 		case *overlapped:
-			ev, _, err := _CreateEventW.Call(null, 0, 0, null)
-			if err != nil {
-				errno, match := err.(syscall.Errno)
-				if !match {
-					return 0, err
-				}
-				if errno != _ERROR_SUCCESS {
-					return 0, errno
-				}
-			}
-			defer _CloseHandle.Call(ev)
 			if arg == nil {
 				return 0, errors.New("call: overlapped is nil")
 			}
 			ovl = arg
+			ev := ovl.ev
+			if ev == null {
+				var err error
+				if ev, err = call(_CreateEventW, null, 0, 0, null); err != nil {
+					return 0, err
+				}
+				defer call(_CloseHandle, ev)
+			}
 			ovl.ovl.hEvent = ev
 			v[i] = uintptr(unsafe.Pointer(&ovl.ovl))
 		case uint8:
@@ -197,33 +215,27 @@ func call(p *syscall.LazyProc, args ...any) (uintptr, error) {
 	}
 
 	r, _, err := p.Call(v...)
+	if ovl == nil {
+		err = callError(err)
+	} else {
+		err = callError(err, _ERROR_IO_PENDING)
+	}
 	if err != nil {
-		errno, match := err.(syscall.Errno)
-		if !match {
-			return 0, err
-		}
-		if errno != _ERROR_SUCCESS && (ovl == nil || errno != _ERROR_IO_PENDING) {
-			return 0, errno
-		}
+		return 0, err
 	}
 
 	if ovl != nil {
 		// the functions that accept OVERLAPPED always have a file handle as first argument
-		if _, _, err = _GetOverlappedResult.Call(v[0], uintptr(unsafe.Pointer(&ovl.ovl)), uintptr(unsafe.Pointer(&ovl.n)), 1); err != nil {
-			errno, match := err.(syscall.Errno)
-			if !match {
-				return 0, err
-			}
-			if errno != _ERROR_SUCCESS {
-				return 0, errno
-			}
+		_, _, err := _GetOverlappedResult.Call(v[0], uintptr(unsafe.Pointer(&ovl.ovl)), uintptr(unsafe.Pointer(&ovl.n)), 1)
+		if err := callError(err); err != nil {
+			return 0, err
 		}
 	}
 
 	return r, nil
 }
 
-func ioctl(fd uintptr, req uint32, in []byte, out []byte) (int, error) {
+func ioctl(fd uintptr, ev uintptr, req uint32, in []byte, out []byte) (int, error) {
 	var (
 		inb  unsafe.Pointer
 		outb unsafe.Pointer
@@ -240,11 +252,18 @@ func ioctl(fd uintptr, req uint32, in []byte, out []byte) (int, error) {
 		outl = uint32(len(out))
 	}
 
-	ovl := overlapped{}
+	ovl := overlapped{ev: ev}
 	if _, err := call(_DeviceIoControl, fd, req, inb, inl, outb, outl, unsafe.Pointer(&rv), &ovl); err != nil {
 		return 0, err
 	}
 	return int(ovl.n), nil
+}
+
+func reportLength(byteLength uint16) uint16 {
+	if byteLength == 0 {
+		return 0
+	}
+	return byteLength - 1
 }
 
 func enumerate() ([]*Device, error) {
@@ -277,14 +296,20 @@ func enumerate() ([]*Device, error) {
 
 		reqSize := uintptr(0)
 		if _, err := call(_SetupDiGetDeviceInterfaceDetailW, devInfo, unsafe.Pointer(&itf), null, 0, unsafe.Pointer(&reqSize), null); err != nil {
-			if errno, match := err.(syscall.Errno); match && errno != _ERROR_INSUFFICIENT_BUFFER {
+			if !errnoIs(err, _ERROR_INSUFFICIENT_BUFFER) {
 				continue
 			}
 		}
 
 		detailBuf := make([]uint16, reqSize/unsafe.Sizeof(uint16(0)))
 		detail := (*_SP_DEVICE_INTERFACE_DETAIL_DATA_W)(unsafe.Pointer(&detailBuf[0]))
-		detail.cbSize = uint32(unsafe.Sizeof(_SP_DEVICE_INTERFACE_DETAIL_DATA_W{}))
+		// the sdk packs this structure to 1 byte on 32 bit windows, so the
+		// trailing padding go adds for alignment is not part of the size that
+		// setupapi validates.
+		detail.cbSize = 8
+		if unsafe.Sizeof(uintptr(0)) == 4 {
+			detail.cbSize = 6
+		}
 
 		if _, err := call(_SetupDiGetDeviceInterfaceDetailW, devInfo, unsafe.Pointer(&itf), unsafe.Pointer(detail), reqSize, null, null); err != nil {
 			continue
@@ -336,9 +361,9 @@ func enumerate() ([]*Device, error) {
 
 			rv.usagePage = caps.usagePage
 			rv.usage = caps.usage
-			rv.reportInputLength = caps.inputReportByteLength - 1
-			rv.reportOutputLength = caps.outputReportByteLength - 1
-			rv.reportFeatureLength = caps.featureReportByteLength - 1
+			rv.reportInputLength = reportLength(caps.inputReportByteLength)
+			rv.reportOutputLength = reportLength(caps.outputReportByteLength)
+			rv.reportFeatureLength = reportLength(caps.featureReportByteLength)
 			rv.reportWithId = true
 			return rv
 		}()
@@ -357,64 +382,29 @@ func (d *Device) open(lock bool) error {
 		return err
 	}
 
-	f, err := call(_CreateFileW, unsafe.Pointer(&pathW[0]), _GENERIC_READ|_GENERIC_WRITE, _FILE_SHARE_READ|_FILE_SHARE_WRITE, null, _OPEN_EXISTING, _FILE_FLAG_OVERLAPPED, null)
+	share := _FILE_SHARE_READ | _FILE_SHARE_WRITE
+	if lock {
+		share = 0
+	}
+
+	f, err := call(_CreateFileW, unsafe.Pointer(&pathW[0]), _GENERIC_READ|_GENERIC_WRITE, share, null, _OPEN_EXISTING, _FILE_FLAG_OVERLAPPED, null)
 	if err != nil {
+		if errnoIs(err, _ERROR_SHARING_VIOLATION) {
+			return ErrDeviceLocked
+		}
 		return err
 	}
 	d.extra.file = f
 
-	if lock {
-		if err := d.lock(); err != nil {
-			call(_CloseHandle, d.extra.file)
-			d.extra.file = null
+	for _, ev := range []*uintptr{&d.extra.evInput, &d.extra.evOutput, &d.extra.evGetFeature, &d.extra.evSetFeature} {
+		h, err := call(_CreateEventW, null, 0, 0, null)
+		if err != nil {
+			d.close()
 			return err
 		}
+		*ev = h
 	}
 	return nil
-}
-
-func (d *Device) lock() error {
-	hash := sha1.Sum([]byte(d.path))
-	lockFile := path.Join(os.TempDir(), "usbhid-"+hex.EncodeToString(hash[:]))
-	if maxPath := 260 - len(".lock") - 1; len(lockFile) > maxPath {
-		lockFile = lockFile[:maxPath]
-	}
-	lockFile += ".lock"
-
-	err := func() error {
-		if err := os.WriteFile(lockFile, []byte{}, 0777); err != nil {
-			return err
-		}
-
-		pathW, err := syscall.UTF16FromString(lockFile)
-		if err != nil {
-			os.Remove(lockFile)
-			return err
-		}
-
-		f, err := call(_CreateFileW, unsafe.Pointer(&pathW[0]), _GENERIC_READ|_GENERIC_WRITE, _FILE_SHARE_READ|_FILE_SHARE_WRITE, null, _OPEN_EXISTING, _FILE_FLAG_OVERLAPPED, null)
-		if err != nil {
-			os.Remove(lockFile)
-			return err
-		}
-
-		ovl := overlapped{}
-		if _, err = call(_LockFileEx, f, _LOCKFILE_EXCLUSIVE_LOCK|_LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ovl); err != nil {
-			call(_CloseHandle, f)
-			os.Remove(lockFile)
-			return err
-		}
-		d.extra.flock = f
-		d.extra.flockPath = lockFile
-		return nil
-	}()
-
-	if err != nil {
-		if errno, match := err.(syscall.Errno); match && errno == _ERROR_LOCK_VIOLATION {
-			return ErrDeviceLocked
-		}
-	}
-	return err
 }
 
 func (d *Device) isOpen() bool {
@@ -427,39 +417,38 @@ func (d *Device) close() error {
 	}
 	d.extra.file = null
 
-	if d.extra.flock != null {
-		if _, err := call(_CloseHandle, d.extra.flock); err != nil {
+	for _, ev := range []*uintptr{&d.extra.evInput, &d.extra.evOutput, &d.extra.evGetFeature, &d.extra.evSetFeature} {
+		if *ev == null {
+			continue
+		}
+		if _, err := call(_CloseHandle, *ev); err != nil {
 			return err
 		}
-		d.extra.flock = null
-		if d.extra.flockPath != "" {
-			if err := os.Remove(d.extra.flockPath); err != nil {
-				return err
-			}
-		}
+		*ev = null
 	}
 	return nil
 }
 
 func (d *Device) getInputReport() (byte, []byte, error) {
-	ovl := overlapped{}
+	ovl := overlapped{ev: d.extra.evInput}
 	buf := make([]byte, d.reportInputLength+1)
 	if _, err := call(_ReadFile, d.extra.file, unsafe.Pointer(&buf[0]), len(buf), 0, &ovl); err != nil {
 		return 0, nil, err
+	}
+	if ovl.n < 1 || ovl.n > uint32(len(buf)) {
+		return 0, nil, fmt.Errorf("invalid report length: %d", ovl.n)
 	}
 	return buf[0], buf[1:ovl.n], nil
 }
 
 func (d *Device) setOutputReport(reportId byte, data []byte) error {
-	buf := data
-	if len(buf) >= int(d.reportOutputLength) {
-		buf = buf[:d.reportOutputLength]
-	} else {
-		buf = append(buf, make([]byte, int(d.reportOutputLength)-len(buf))...)
-	}
-	buf = append([]byte{reportId}, buf...)
+	// windows expects a buffer of the full report length, even when the report
+	// for this id is shorter.
+	buf := make([]byte, d.reportOutputLength+1)
+	buf[0] = reportId
+	copy(buf[1:], data)
 
-	_, err := call(_WriteFile, d.extra.file, unsafe.Pointer(&buf[0]), len(buf), 0, &overlapped{})
+	_, err := call(_WriteFile, d.extra.file, unsafe.Pointer(&buf[0]), len(buf), 0, &overlapped{ev: d.extra.evOutput})
 	return err
 }
 
@@ -467,16 +456,23 @@ func (d *Device) getFeatureReport(reportId byte) ([]byte, error) {
 	buf := make([]byte, d.reportFeatureLength+1)
 	buf[0] = reportId
 
-	n, err := ioctl(d.extra.file, _IOCTL_HID_GET_FEATURE, nil, buf)
+	n, err := ioctl(d.extra.file, d.extra.evGetFeature, _IOCTL_HID_GET_FEATURE, nil, buf)
 	if err != nil {
 		return nil, err
+	}
+	if n < 1 || n > len(buf) {
+		return nil, fmt.Errorf("invalid report length: %d", n)
 	}
 	return buf[1:n], nil
 }
 
 func (d *Device) setFeatureReport(reportId byte, data []byte) error {
-	buf := append([]byte{reportId}, data...)
+	// windows expects a buffer of the full report length, even when the report
+	// for this id is shorter.
+	buf := make([]byte, d.reportFeatureLength+1)
+	buf[0] = reportId
+	copy(buf[1:], data)
 
-	_, err := ioctl(d.extra.file, _IOCTL_HID_SET_FEATURE, buf, nil)
+	_, err := ioctl(d.extra.file, d.extra.evSetFeature, _IOCTL_HID_SET_FEATURE, buf, nil)
 	return err
 }

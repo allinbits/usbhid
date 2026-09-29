@@ -12,6 +12,37 @@ import (
 	"unsafe"
 )
 
+// stubIOKit replaces the native functions reached by the device lifecycle with
+// harmless defaults, and restores all of them when the test ends. Tests
+// override only the ones whose behaviour they care about.
+func stubIOKit(t *testing.T) {
+	originalClose := _IOHIDDeviceClose
+	originalRelease := _CFRelease
+	originalPush := _objc_autoreleasePoolPush
+	originalPop := _objc_autoreleasePoolPop
+	originalSetReport := _IOHIDDeviceSetReportWithCallback
+	originalGetReport := _IOHIDDeviceGetReport
+	originalSignal := _CFRunLoopSourceSignal
+	originalWakeUp := _CFRunLoopWakeUp
+	t.Cleanup(func() {
+		_IOHIDDeviceClose = originalClose
+		_CFRelease = originalRelease
+		_objc_autoreleasePoolPush = originalPush
+		_objc_autoreleasePoolPop = originalPop
+		_IOHIDDeviceSetReportWithCallback = originalSetReport
+		_IOHIDDeviceGetReport = originalGetReport
+		_CFRunLoopSourceSignal = originalSignal
+		_CFRunLoopWakeUp = originalWakeUp
+	})
+
+	_IOHIDDeviceClose = func(_ _IOHIDDeviceRef, _ _IOOptionBits) _IOReturn { return kIOReturnSuccess }
+	_CFRelease = func(_ _CFTypeRef) {}
+	_objc_autoreleasePoolPush = func() uintptr { return 1 }
+	_objc_autoreleasePoolPop = func(_ uintptr) {}
+	_CFRunLoopSourceSignal = func(_ _CFRunLoopSourceRef) {}
+	_CFRunLoopWakeUp = func(_ _CFRunLoopRef) {}
+}
+
 func TestDarwinSystemAllocator(t *testing.T) {
 	allocator := systemAllocator()
 	if allocator == 0 {
@@ -22,6 +53,24 @@ func TestDarwinSystemAllocator(t *testing.T) {
 		t.Fatal("CFAllocatorAllocate returned nil")
 	}
 	_CFAllocatorDeallocate(allocator, ptr)
+}
+
+func TestDarwinCFStringRoundTrip(t *testing.T) {
+	for _, want := range []string{"ascii", "Vendor®", "日本語"} {
+		b := []byte(want)
+		str := _CFStringCreateWithBytes(kCFAllocatorDefault, b, _CFIndex(len(b)), kCFStringEncodingUTF8, false)
+		if str == 0 {
+			t.Fatalf("failed to create string for %q", want)
+		}
+		got, err := cfstringToString(str)
+		_CFRelease(_CFTypeRef(str))
+		if err != nil {
+			t.Fatalf("failed to convert %q: %v", want, err)
+		}
+		if got != want {
+			t.Fatalf("string round trip mismatch: got %q, want %q", got, want)
+		}
+	}
 }
 
 func TestDarwinIOReturnError(t *testing.T) {
@@ -68,21 +117,7 @@ func TestDarwinInputCallbackRejectsInvalidLength(t *testing.T) {
 }
 
 func TestDarwinCloseUnblocksInputReader(t *testing.T) {
-	originalClose := _IOHIDDeviceClose
-	originalRelease := _CFRelease
-	originalPush := _objc_autoreleasePoolPush
-	originalPop := _objc_autoreleasePoolPop
-	defer func() {
-		_IOHIDDeviceClose = originalClose
-		_CFRelease = originalRelease
-		_objc_autoreleasePoolPush = originalPush
-		_objc_autoreleasePoolPop = originalPop
-	}()
-
-	_IOHIDDeviceClose = func(_ _IOHIDDeviceRef, _ _IOOptionBits) _IOReturn { return kIOReturnSuccess }
-	_CFRelease = func(_ _CFTypeRef) {}
-	_objc_autoreleasePoolPush = func() uintptr { return 1 }
-	_objc_autoreleasePoolPop = func(_ uintptr) {}
+	stubIOKit(t)
 
 	d := &Device{}
 	d.extra.state = deviceOpen
@@ -113,22 +148,7 @@ func TestDarwinCloseUnblocksInputReader(t *testing.T) {
 }
 
 func TestDarwinCloseWaitsForAsynchronousIOBeforeTeardown(t *testing.T) {
-	originalSetReport := _IOHIDDeviceSetReportWithCallback
-	originalSignal := _CFRunLoopSourceSignal
-	originalWakeUp := _CFRunLoopWakeUp
-	originalClose := _IOHIDDeviceClose
-	originalRelease := _CFRelease
-	originalPush := _objc_autoreleasePoolPush
-	originalPop := _objc_autoreleasePoolPop
-	defer func() {
-		_IOHIDDeviceSetReportWithCallback = originalSetReport
-		_CFRunLoopSourceSignal = originalSignal
-		_CFRunLoopWakeUp = originalWakeUp
-		_IOHIDDeviceClose = originalClose
-		_CFRelease = originalRelease
-		_objc_autoreleasePoolPush = originalPush
-		_objc_autoreleasePoolPop = originalPop
-	}()
+	stubIOKit(t)
 
 	ioStarted := make(chan struct{})
 	allowIO := make(chan struct{})
@@ -146,14 +166,9 @@ func TestDarwinCloseWaitsForAsynchronousIOBeforeTeardown(t *testing.T) {
 			go fn()
 		default:
 			teardownStarted <- struct{}{}
+			close(d.extra.runloopDone)
 		}
 	}
-	_CFRunLoopWakeUp = func(_ _CFRunLoopRef) {}
-	_IOHIDDeviceClose = func(_ _IOHIDDeviceRef, _ _IOOptionBits) _IOReturn { return kIOReturnSuccess }
-	_CFRelease = func(_ _CFTypeRef) {}
-	_objc_autoreleasePoolPush = func() uintptr { return 1 }
-	_objc_autoreleasePoolPop = func(_ uintptr) {}
-
 	d = &Device{}
 	d.extra.state = deviceOpen
 	d.extra.file = 1
@@ -162,7 +177,6 @@ func TestDarwinCloseWaitsForAsynchronousIOBeforeTeardown(t *testing.T) {
 	d.extra.reportCh = make(chan _IOReturn, 1)
 	d.extra.done = make(chan struct{})
 	d.extra.runloopDone = make(chan struct{})
-	close(d.extra.runloopDone)
 	d.extra.callbackHandle = registerCallbackDevice(d)
 	defer unregisterCallbackDevice(d.extra.callbackHandle)
 
@@ -208,22 +222,7 @@ func TestDarwinCloseWaitsForAsynchronousIOBeforeTeardown(t *testing.T) {
 }
 
 func TestDarwinRemovalDuringAsynchronousIODefersRelease(t *testing.T) {
-	originalSetReport := _IOHIDDeviceSetReportWithCallback
-	originalSignal := _CFRunLoopSourceSignal
-	originalWakeUp := _CFRunLoopWakeUp
-	originalClose := _IOHIDDeviceClose
-	originalRelease := _CFRelease
-	originalPush := _objc_autoreleasePoolPush
-	originalPop := _objc_autoreleasePoolPop
-	defer func() {
-		_IOHIDDeviceSetReportWithCallback = originalSetReport
-		_CFRunLoopSourceSignal = originalSignal
-		_CFRunLoopWakeUp = originalWakeUp
-		_IOHIDDeviceClose = originalClose
-		_CFRelease = originalRelease
-		_objc_autoreleasePoolPush = originalPush
-		_objc_autoreleasePoolPop = originalPop
-	}()
+	stubIOKit(t)
 
 	ioStarted := make(chan struct{})
 	allowIO := make(chan struct{})
@@ -240,13 +239,10 @@ func TestDarwinRemovalDuringAsynchronousIODefersRelease(t *testing.T) {
 		case fn := <-d.extra.ioCh:
 			go fn()
 		default:
+			close(d.extra.runloopDone)
 		}
 	}
-	_CFRunLoopWakeUp = func(_ _CFRunLoopRef) {}
-	_IOHIDDeviceClose = func(_ _IOHIDDeviceRef, _ _IOOptionBits) _IOReturn { return kIOReturnSuccess }
 	_CFRelease = func(_ _CFTypeRef) { released <- struct{}{} }
-	_objc_autoreleasePoolPush = func() uintptr { return 1 }
-	_objc_autoreleasePoolPop = func(_ uintptr) {}
 
 	d = &Device{}
 	d.extra.state = deviceOpen
@@ -256,7 +252,6 @@ func TestDarwinRemovalDuringAsynchronousIODefersRelease(t *testing.T) {
 	d.extra.reportCh = make(chan _IOReturn, 1)
 	d.extra.done = make(chan struct{})
 	d.extra.runloopDone = make(chan struct{})
-	close(d.extra.runloopDone)
 	handle := registerCallbackDevice(d)
 	d.extra.callbackHandle = handle
 
@@ -328,14 +323,7 @@ func TestDarwinFinishOpenPublishesOpenState(t *testing.T) {
 }
 
 func TestDarwinAsynchronousReportFraming(t *testing.T) {
-	originalSetReport := _IOHIDDeviceSetReportWithCallback
-	originalSignal := _CFRunLoopSourceSignal
-	originalWakeUp := _CFRunLoopWakeUp
-	defer func() {
-		_IOHIDDeviceSetReportWithCallback = originalSetReport
-		_CFRunLoopSourceSignal = originalSignal
-		_CFRunLoopWakeUp = originalWakeUp
-	}()
+	stubIOKit(t)
 
 	var got []byte
 	_IOHIDDeviceSetReportWithCallback = func(_ _IOHIDDeviceRef, typ _IOHIDReportType, reportId _CFIndex, report unsafe.Pointer, reportLength _CFIndex, _ _CFTimeInterval, _ uintptr, context uintptr) _IOReturn {
@@ -343,9 +331,6 @@ func TestDarwinAsynchronousReportFraming(t *testing.T) {
 		reportCallback(context, kIOReturnSuccess, 0, typ, uint32(reportId), report, reportLength)
 		return kIOReturnSuccess
 	}
-	_CFRunLoopSourceSignal = func(_ _CFRunLoopSourceRef) {}
-	_CFRunLoopWakeUp = func(_ _CFRunLoopRef) {}
-
 	d := &Device{reportWithId: true}
 	d.extra.state = deviceOpen
 	d.extra.file = 1
@@ -364,18 +349,41 @@ func TestDarwinAsynchronousReportFraming(t *testing.T) {
 	}
 }
 
-func TestDarwinSynchronousFeatureReportUsesReturnedLength(t *testing.T) {
-	originalGetReport := _IOHIDDeviceGetReport
-	originalPush := _objc_autoreleasePoolPush
-	originalPop := _objc_autoreleasePoolPop
-	defer func() {
-		_IOHIDDeviceGetReport = originalGetReport
-		_objc_autoreleasePoolPush = originalPush
-		_objc_autoreleasePoolPop = originalPop
-	}()
+func TestDarwinSetReportUnblocksWhenRunloopExits(t *testing.T) {
+	stubIOKit(t)
 
-	_objc_autoreleasePoolPush = func() uintptr { return 1 }
-	_objc_autoreleasePoolPop = func(_ uintptr) {}
+	var d *Device
+	_CFRunLoopSourceSignal = func(_ _CFRunLoopSourceRef) {
+		// the run loop exits without ever performing the queued operation.
+		close(d.extra.runloopDone)
+	}
+
+	d = &Device{}
+	d.extra.state = deviceOpen
+	d.extra.file = 1
+	d.extra.ioSource = 1
+	d.extra.ioCh = make(chan func(), 1)
+	d.extra.reportCh = make(chan _IOReturn, 1)
+	d.extra.runloopDone = make(chan struct{})
+	d.extra.callbackHandle = registerCallbackDevice(d)
+	defer unregisterCallbackDevice(d.extra.callbackHandle)
+
+	result := make(chan error, 1)
+	go func() { result <- d.setFeatureReport(0, []byte{1}) }()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrDeviceIsClosed) {
+			t.Fatalf("set feature report returned %v, want ErrDeviceIsClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("set feature report remained blocked after the run loop exited")
+	}
+}
+
+func TestDarwinSynchronousFeatureReportUsesReturnedLength(t *testing.T) {
+	stubIOKit(t)
+
 	_IOHIDDeviceGetReport = func(_ _IOHIDDeviceRef, _ _IOHIDReportType, _ _CFIndex, report []byte, length *_CFIndex) _IOReturn {
 		copy(report, []byte{4, 8, 9})
 		*length = 3

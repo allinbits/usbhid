@@ -89,7 +89,6 @@ type deviceExtra struct {
 	inputBuffer    unsafe.Pointer
 	inputBufferLen _CFIndex
 	inputCh        chan inputCtx
-	inputClosed    bool
 	callbackHandle uintptr
 }
 
@@ -103,6 +102,14 @@ const (
 	deviceDisconnected
 	deviceRunloopFailed
 )
+
+func (s deviceState) live() bool {
+	return s == deviceOpening || s == deviceOpen
+}
+
+// queues input reports delivered between GetInputReport calls, mirroring the
+// ring that hidraw and the windows hid class driver keep in the kernel.
+const inputQueueLength = 64
 
 const (
 	kCFAllocatorDefault _CFAllocatorRef = 0
@@ -135,7 +142,7 @@ var (
 	_CFSetGetCount           func(theSet _CFSetRef) _CFIndex
 	_CFSetGetValues          func(theSet _CFSetRef, value unsafe.Pointer)
 	_CFStringCreateWithBytes func(alloc _CFAllocatorRef, bytes []byte, numBytes _CFIndex, encoding _CFStringEncoding, isExternalRepresentation bool) _CFStringRef
-	_CFStringGetCString      func(theString _CFStringRef, buffer []byte, encoding _CFStringEncoding) bool
+	_CFStringGetCString      func(theString _CFStringRef, buffer []byte, bufferSize _CFIndex, encoding _CFStringEncoding) bool
 	_CFStringGetLength       func(theString _CFStringRef) _CFIndex
 
 	_objc_autoreleasePoolPush func() uintptr
@@ -188,6 +195,13 @@ var (
 	reportCallbackPtr        = purego.NewCallback(reportCallback)
 	sourcePerformCallbackPtr = purego.NewCallback(sourcePerformCallback)
 )
+
+var propertyKeys = struct {
+	sync.Mutex
+	keys map[string]_CFStringRef
+}{
+	keys: map[string]_CFStringRef{},
+}
 
 var callbackDevices = struct {
 	sync.RWMutex
@@ -271,6 +285,7 @@ func init() {
 	if mgr == 0 {
 		panic("failed to create iohid manager")
 	}
+	_IOHIDManagerSetDeviceMatching(mgr, 0)
 }
 
 type ioReturnError _IOReturn
@@ -288,19 +303,35 @@ func byteSliceToString(b []byte) string {
 
 func cfstringToString(str _CFStringRef) (string, error) {
 	buf := make([]byte, _CFStringGetLength(str)*4+1)
-	if !_CFStringGetCString(str, buf[:], kCFStringEncodingUTF8) {
+	if !_CFStringGetCString(str, buf, _CFIndex(len(buf)), kCFStringEncodingUTF8) {
 		return "", errors.New("failed to convert string")
 	}
 	return byteSliceToString(buf[:]), nil
 }
 
-func getProperty(device _IOHIDDeviceRef, key string) (_CFTypeRef, error) {
+// the lookup keys are constant and IOHIDDeviceGetProperty does not consume
+// them, so they are created once and kept for the lifetime of the process.
+func propertyKey(key string) _CFStringRef {
+	propertyKeys.Lock()
+	defer propertyKeys.Unlock()
+
+	if skey, ok := propertyKeys.keys[key]; ok {
+		return skey
+	}
+
 	bkey := []byte(key)
 	skey := _CFStringCreateWithBytes(kCFAllocatorDefault, bkey, _CFIndex(len(bkey)), kCFStringEncodingUTF8, false)
+	if skey != 0 {
+		propertyKeys.keys[key] = skey
+	}
+	return skey
+}
+
+func getProperty(device _IOHIDDeviceRef, key string) (_CFTypeRef, error) {
+	skey := propertyKey(key)
 	if skey == 0 {
 		return 0, fmt.Errorf("failed to allocate memory for device property lookup key: %s", key)
 	}
-	defer _CFRelease(_CFTypeRef(skey))
 
 	prop := _IOHIDDeviceGetProperty(device, skey)
 	if prop == 0 {
@@ -343,8 +374,6 @@ func enumerate() ([]*Device, error) {
 
 	pool := _objc_autoreleasePoolPush()
 	defer _objc_autoreleasePoolPop(pool)
-
-	_IOHIDManagerSetDeviceMatching(mgr, 0)
 
 	rv := []*Device{}
 
@@ -406,12 +435,11 @@ func enumerate() ([]*Device, error) {
 			dev.serialNumber = prop
 		}
 
-		descriptor := []byte{}
+		var descriptor []byte
 		if prop, err := getProperty(device, "ReportDescriptor"); err == nil {
 			l := _CFDataGetLength(_CFDataRef(prop))
-			buf := make([]byte, l)
-			_CFDataGetBytes(_CFDataRef(prop), _CFRange{0, l}, buf[:])
-			descriptor = append(descriptor, buf[:]...)
+			descriptor = make([]byte, l)
+			_CFDataGetBytes(_CFDataRef(prop), _CFRange{0, l}, descriptor)
 		}
 
 		dev.usagePage, dev.usage, dev.reportInputLength, dev.reportOutputLength, dev.reportFeatureLength, dev.reportWithId = hidParseReportDescriptor(descriptor)
@@ -436,7 +464,7 @@ func inputCallback(context uintptr, result _IOReturn, sender uintptr, reportType
 	d.extra.stateMtx.Lock()
 	defer d.extra.stateMtx.Unlock()
 
-	if d.extra.inputClosed {
+	if !d.extra.state.live() {
 		return
 	}
 
@@ -469,7 +497,6 @@ func removalCallback(context uintptr, result _IOReturn, sender uintptr) {
 		return
 	}
 	d.extra.state = deviceDisconnected
-	d.extra.inputClosed = true
 	close(d.extra.done)
 	d.extra.stateMtx.Unlock()
 
@@ -567,7 +594,6 @@ func systemAllocator() _CFAllocatorRef {
 func (d *Device) open(lock bool) (err error) {
 	d.extra.lifeMtx.Lock()
 	defer d.extra.lifeMtx.Unlock()
-	sessionPublished := false
 
 	d.extra.stateMtx.Lock()
 	if d.extra.state != deviceClosed {
@@ -577,23 +603,46 @@ func (d *Device) open(lock bool) (err error) {
 	d.extra.state = deviceOpening
 	d.extra.stateMtx.Unlock()
 
+	options := kIOHIDOptionsTypeNone
+	if lock {
+		options = kIOHIDOptionsTypeSeizeDevice
+	}
+
+	var (
+		sessionPublished bool
+		opened           bool
+		file             _IOHIDDeviceRef
+		inputBuffer      unsafe.Pointer
+		callbackHandle   uintptr
+	)
+
+	// the session owns whatever was acquired here once it is published. until
+	// then this is the only thing that releases it.
 	defer func() {
-		if err != nil && !sessionPublished {
-			d.extra.stateMtx.Lock()
-			d.extra.state = deviceClosed
-			d.extra.stateMtx.Unlock()
+		if err == nil || sessionPublished {
+			return
 		}
+		if callbackHandle != 0 {
+			unregisterCallbackDevice(callbackHandle)
+		}
+		if inputBuffer != nil {
+			_CFAllocatorDeallocate(systemAllocator(), inputBuffer)
+		}
+		if file != 0 {
+			if opened {
+				_IOHIDDeviceClose(file, options)
+			}
+			_CFRelease(_CFTypeRef(file))
+		}
+		d.extra.stateMtx.Lock()
+		d.extra.state = deviceClosed
+		d.extra.stateMtx.Unlock()
 	}()
 
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	pool := _objc_autoreleasePoolPush()
 	defer _objc_autoreleasePoolPop(pool)
-
-	options := kIOHIDOptionsTypeNone
-	if lock {
-		options = kIOHIDOptionsTypeSeizeDevice
-	}
 
 	pathB := make([]byte, 512)
 	copy(pathB[:], d.path)
@@ -603,24 +652,22 @@ func (d *Device) open(lock bool) (err error) {
 	}
 	defer _IOObjectRelease(entry)
 
-	file := _IOHIDDeviceCreate(kCFAllocatorDefault, entry)
+	file = _IOHIDDeviceCreate(kCFAllocatorDefault, entry)
 	if file == 0 {
 		return errors.New("failed to create iohid device")
 	}
 
 	if rv := _IOHIDDeviceOpen(file, options); rv != kIOReturnSuccess {
-		_CFRelease(_CFTypeRef(file))
 		if rv == kIOReturnExclusiveAccess {
 			return ErrDeviceLocked
 		}
 		return ioReturnError(rv)
 	}
+	opened = true
 
 	inputBufferLen := _CFIndex(d.reportInputLength + 1)
-	inputBuffer := _CFAllocatorAllocate(systemAllocator(), inputBufferLen, 0)
+	inputBuffer = _CFAllocatorAllocate(systemAllocator(), inputBufferLen, 0)
 	if inputBuffer == nil {
-		_IOHIDDeviceClose(file, options)
-		_CFRelease(_CFTypeRef(file))
 		return errors.New("failed to allocate input report buffer")
 	}
 	inputBytes := unsafe.Slice((*byte)(inputBuffer), int(inputBufferLen))
@@ -628,7 +675,7 @@ func (d *Device) open(lock bool) (err error) {
 		inputBytes[i] = 0
 	}
 
-	callbackHandle := registerCallbackDevice(d)
+	callbackHandle = registerCallbackDevice(d)
 	callbackContext := callbackHandle
 	ioSource := _CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &_CFRunLoopSourceContext{
 		version: 0,
@@ -636,14 +683,10 @@ func (d *Device) open(lock bool) (err error) {
 		perform: sourcePerformCallbackPtr,
 	})
 	if ioSource == 0 {
-		unregisterCallbackDevice(callbackHandle)
-		_CFAllocatorDeallocate(systemAllocator(), inputBuffer)
-		_IOHIDDeviceClose(file, options)
-		_CFRelease(_CFTypeRef(file))
 		return errors.New("failed to create run loop source")
 	}
 
-	inputCh := make(chan inputCtx)
+	inputCh := make(chan inputCtx, inputQueueLength)
 	done := make(chan struct{})
 	runloopDone := make(chan struct{})
 	ioCh := make(chan func(), 1)
@@ -662,7 +705,6 @@ func (d *Device) open(lock bool) (err error) {
 	d.extra.inputBuffer = inputBuffer
 	d.extra.inputBufferLen = inputBufferLen
 	d.extra.inputCh = inputCh
-	d.extra.inputClosed = false
 	d.extra.callbackHandle = callbackHandle
 	d.extra.stateMtx.Unlock()
 	sessionPublished = true
@@ -714,7 +756,6 @@ func (d *Device) open(lock bool) (err error) {
 			d.extra.state = deviceRunloopFailed
 			close(d.extra.done)
 		}
-		d.extra.inputClosed = true
 		d.extra.stateMtx.Unlock()
 		if unexpectedStop {
 			// unexpected run-loop exit has no Close caller holding ioMtx.
@@ -773,12 +814,11 @@ func (d *Device) close() error {
 
 	disconnected := d.extra.state == deviceDisconnected
 	runloopFailed := d.extra.state == deviceRunloopFailed
-	doneClosed := disconnected || runloopFailed || d.extra.state == deviceClosing
+	doneClosed := !d.extra.state.live()
 	if !doneClosed {
 		d.extra.state = deviceClosing
 		close(d.extra.done)
 	}
-	d.extra.inputClosed = true
 	file := d.extra.file
 	options := d.extra.options
 	runloop := d.extra.runloop
@@ -891,15 +931,16 @@ func (d *Device) setReport(typ _IOHIDReportType, reportId byte, data []byte) err
 	ioSource := d.extra.ioSource
 	ioCh := d.extra.ioCh
 	reportCh := d.extra.reportCh
+	runloopDone := d.extra.runloopDone
 	callbackHandle := d.extra.callbackHandle
 	d.extra.stateMtx.Unlock()
 
-	buf := append([]byte{}, data...)
+	reportLen := len(data)
 	if d.reportWithId {
-		buf = append([]byte{reportId}, buf...)
+		reportLen++
 	}
 
-	allocationLen := _CFIndex(len(buf))
+	allocationLen := _CFIndex(reportLen)
 	if allocationLen == 0 {
 		allocationLen = 1
 	}
@@ -907,8 +948,21 @@ func (d *Device) setReport(typ _IOHIDReportType, reportId byte, data []byte) err
 	if report == nil {
 		return errors.New("failed to allocate report buffer")
 	}
-	defer _CFAllocatorDeallocate(systemAllocator(), report)
-	copy(unsafe.Slice((*byte)(report), int(allocationLen)), buf)
+	completed := false
+	defer func() {
+		// iokit owns the buffer until it delivers the completion. leaking it
+		// is preferable to freeing memory it may still write to.
+		if completed {
+			_CFAllocatorDeallocate(systemAllocator(), report)
+		}
+	}()
+	buf := unsafe.Slice((*byte)(report), int(allocationLen))
+	if d.reportWithId {
+		buf[0] = reportId
+		copy(buf[1:], data)
+	} else {
+		copy(buf, data)
+	}
 
 	// ioMtx permits only one report operation at a time, so any value left
 	// here would belong to an operation that violated IOKit's callback
@@ -919,7 +973,7 @@ func (d *Device) setReport(typ _IOHIDReportType, reportId byte, data []byte) err
 	}
 
 	ioCh <- func() {
-		rv := _IOHIDDeviceSetReportWithCallback(file, typ, _CFIndex(reportId), report, _CFIndex(len(buf)), 0, reportCallbackPtr, callbackHandle)
+		rv := _IOHIDDeviceSetReportWithCallback(file, typ, _CFIndex(reportId), report, _CFIndex(reportLen), 0, reportCallbackPtr, callbackHandle)
 		if rv != kIOReturnSuccess {
 			select {
 			case reportCh <- rv:
@@ -930,11 +984,28 @@ func (d *Device) setReport(typ _IOHIDReportType, reportId byte, data []byte) err
 	_CFRunLoopSourceSignal(ioSource)
 	_CFRunLoopWakeUp(runloop)
 
-	result := <-reportCh
-	if result != kIOReturnSuccess {
-		return ioReturnError(result)
+	select {
+	case result := <-reportCh:
+		completed = true
+		if result != kIOReturnSuccess {
+			return ioReturnError(result)
+		}
+		return nil
+
+	case <-runloopDone:
+		// completions are delivered by the run loop, so once it exits none
+		// can arrive anymore.
+		select {
+		case result := <-reportCh:
+			completed = true
+			if result != kIOReturnSuccess {
+				return ioReturnError(result)
+			}
+			return nil
+		default:
+			return ErrDeviceIsClosed
+		}
 	}
-	return nil
 }
 
 func (d *Device) setOutputReport(reportId byte, data []byte) error {

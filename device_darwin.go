@@ -285,7 +285,6 @@ func init() {
 	if mgr == 0 {
 		panic("failed to create iohid manager")
 	}
-	_IOHIDManagerSetDeviceMatching(mgr, 0)
 }
 
 type ioReturnError _IOReturn
@@ -376,6 +375,10 @@ func enumerate() ([]*Device, error) {
 	defer _objc_autoreleasePoolPop(pool)
 
 	rv := []*Device{}
+
+	// the manager is not scheduled on a run loop, so it never processes
+	// hotplug notifications. setting the matching rebuilds its device set.
+	_IOHIDManagerSetDeviceMatching(mgr, 0)
 
 	device_set := _IOHIDManagerCopyDevices(mgr)
 	if device_set == 0 {

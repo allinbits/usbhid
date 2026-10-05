@@ -57,4 +57,4 @@ defer device.Close()
 
 - [Development guide](10_development-guide.md) -- integration, API overview, and platform details
 - [API documentation](https://pkg.go.dev/rafaelmartins.com/p/usbhid) -- complete API reference on pkg.go.dev
-- [Source code](https://git.rafaelmartins.com/rafaelmartins/usbhid) -- git repository
+- [Source code](https://git.rafaelmartins.com/rafaelmartins/usbhid) -- Git repository

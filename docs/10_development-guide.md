@@ -78,6 +78,8 @@ The [`Device`](https://pkg.go.dev/rafaelmartins.com/p/usbhid#Device) struct is o
 | `GetOutputReportLength()` | `uint16` | Output report data size in bytes |
 | `GetFeatureReportLength()` | `uint16` | Feature report data size in bytes |
 
+The report lengths are the size of the largest report of each type, without the report ID byte.
+
 The `String()` method returns a human-readable representation including vendor ID, product ID, and available string descriptors.
 
 ### Opening and closing
@@ -95,7 +97,7 @@ Calling `Open` on an already-open device returns `ErrDeviceIsOpen`. Calling `Clo
 
 ### Reading input reports
 
-[`GetInputReport`](https://pkg.go.dev/rafaelmartins.com/p/usbhid#Device.GetInputReport) blocks until an input report is available, then returns the report ID and the report data as a byte slice.
+[`GetInputReport`](https://pkg.go.dev/rafaelmartins.com/p/usbhid#Device.GetInputReport) blocks until an input report is available, then returns the report ID and the report data as a byte slice. The report ID is `0` for devices that do not use report IDs. The slice holds the bytes delivered by the operating system, so its length may differ from `GetInputReportLength()`.
 
 ```go
 reportId, data, err := device.GetInputReport()
@@ -110,7 +112,7 @@ fmt.Printf("Report ID: %d, Data: %x\n", reportId, data)
 
 ### Writing output reports
 
-[`SetOutputReport`](https://pkg.go.dev/rafaelmartins.com/p/usbhid#Device.SetOutputReport) sends an output report. Provide the report ID and the data to send. If the data is longer than the expected report size, `ErrReportBufferOverflow` is returned.
+[`SetOutputReport`](https://pkg.go.dev/rafaelmartins.com/p/usbhid#Device.SetOutputReport) sends an output report. Provide the report ID and the data to send. If the data is longer than `GetOutputReportLength()`, `ErrReportBufferOverflow` is returned. Any padding required by the operating system is handled internally.
 
 ```go
 err := device.SetOutputReport(0x01, []byte{0x00, 0x01, 0x02})
@@ -121,7 +123,7 @@ if err != nil {
 
 ### Feature reports
 
-[`GetFeatureReport`](https://pkg.go.dev/rafaelmartins.com/p/usbhid#Device.GetFeatureReport) reads a feature report by ID. [`SetFeatureReport`](https://pkg.go.dev/rafaelmartins.com/p/usbhid#Device.SetFeatureReport) writes a feature report. The same overflow rules apply to `SetFeatureReport` as to `SetOutputReport`.
+[`GetFeatureReport`](https://pkg.go.dev/rafaelmartins.com/p/usbhid#Device.GetFeatureReport) reads a feature report by ID. [`SetFeatureReport`](https://pkg.go.dev/rafaelmartins.com/p/usbhid#Device.SetFeatureReport) writes a feature report. The same overflow and padding rules apply to `SetFeatureReport` as to `SetOutputReport`, against `GetFeatureReportLength()`.
 
 ```go
 data, err := device.GetFeatureReport(0x01)
@@ -165,7 +167,7 @@ The Linux backend enumerates devices by walking `/sys/bus/usb/devices` and readi
 
 Exclusive locking uses `flock(2)` with `LOCK_EX|LOCK_NB`.
 
-The ioctl encoding is architecture-aware and supports: `386`, `amd64`, `arm`, `arm64`, `loong64`, `riscv64`, `s390x`, `mips`, `mips64`, `mips64le`, `mipsle`, `ppc`, `ppc64`, `ppc64le`, and `sparc64`.
+The ioctl encoding is architecture-aware and supports: `386`, `amd64`, `arm`, `arm64`, `loong64`, `riscv64`, `s390x`, `mips`, `mips64`, `mips64le`, `mipsle`, `ppc`, `ppc64`, `ppc64le`, and `sparc64`. On any other architecture, the package panics during initialization.
 
 > [!NOTE]
 > Many USB HID devices are inaccessible to regular users by default on Linux. Depending on the device, the user may need to be added to a specific group (e.g. `plugdev` or `input`) or create a udev rule to grant access. This is outside the scope of this library.
@@ -174,18 +176,24 @@ The ioctl encoding is architecture-aware and supports: `386`, `amd64`, `arm`, `a
 
 The macOS backend uses IOKit's HID Manager through [purego](https://github.com/ebitengine/purego) to call CoreFoundation and IOKit functions without cgo. Device properties are read from the IOKit registry. HID report descriptors are obtained from the `ReportDescriptor` property and parsed by the library.
 
-A dedicated goroutine runs a CFRunLoop to receive input report and device removal callbacks. The library handles device disconnection gracefully -- a blocking `GetInputReport` call returns `ErrDeviceIsClosed` if the device is unplugged while waiting.
+A single `IOHIDManager` is created for the process when the package is initialized. Each `Enumerate` call resets its device matching to rebuild the device set, so devices plugged in or removed between calls are picked up. Only devices whose `Transport` property is `USB` are listed.
+
+Each open device has a dedicated goroutine, locked to its OS thread, that runs a CFRunLoop. Input report and device removal callbacks are delivered on it, and output and feature report writes are dispatched to it. Input reports that arrive between `GetInputReport` calls are queued, up to 64 reports; when the queue is full, new reports are dropped.
+
+When the device is unplugged, the library closes it automatically, and a blocking `GetInputReport` call returns `ErrDeviceIsClosed`.
 
 Exclusive locking uses `kIOHIDOptionsTypeSeizeDevice`.
 
 ### Windows
 
-The Windows backend uses SetupAPI for device enumeration and `hid.dll` for HID-specific operations. Device attributes and capabilities are obtained through `HidD_GetAttributes` and `HidP_GetCaps`. I/O uses overlapped operations through the kernel32 API.
+The Windows backend uses SetupAPI for device enumeration and `hid.dll` for HID-specific operations. The device list is built from the present device interfaces of the HID class (`HidD_GetHidGuid`), without filtering by transport. Device attributes and capabilities are obtained through `HidD_GetAttributes` and `HidP_GetCaps`. I/O uses overlapped operations through the kernel32 API.
+
+Windows expects output and feature report buffers of the full report length, so shorter data is zero-padded internally.
 
 Exclusive locking opens the device handle with a share mode of zero, so the kernel denies every other process access to the device until the handle is closed.
 
 > [!WARNING]
-> Windows does not allow user-space applications to access full HID report descriptors. As a result, the library cannot validate report data sizes on a per-report basis -- it can only verify the largest possible size for each report category (input, output, feature). Library consumers should know the report descriptors for their target devices and ensure data adheres to them, or implement their own validation.
+> Windows does not allow user-space applications to access full HID report descriptors. As a result, per-report sizes are unknown to the library on this platform -- only the largest possible size for each report category (input, output, feature) is available. Library consumers should know the report descriptors for their target devices and ensure data adheres to them, or implement their own validation.
 
 ## Source files
 
@@ -197,10 +205,11 @@ Exclusive locking opens the device handle with a share mode of zero, so the kern
 | `device_windows.go` | Windows backend: SetupAPI enumeration, HID.dll operations, overlapped I/O |
 | `hid_parser.go` | HID report descriptor parser: extracts usage page, usage, and report sizes |
 | `hid_parser_test.go` | Tests for the HID report descriptor parser |
-| `example_test.go` | Runnable examples for `Enumerate` and `DeviceFilterFunc` |
+| `device_darwin_test.go` | Tests for the macOS backend: device lifecycle, callbacks, report framing |
+| `example_test.go` | Examples for `Enumerate` and `DeviceFilterFunc` |
 
 ## Known limitations
 
-- **Blocking API.** All I/O operations block the calling goroutine. To interact with devices asynchronously, use goroutines, channels, or synchronization primitives. Ongoing I/O operations are not cancelled when the device is closed.
-- **Windows report size validation.** Due to Windows API limitations, the library cannot validate report data sizes per individual report ID -- only the largest size per report category is known. This is a platform constraint shared by most mainstream USB HID libraries.
+- **Blocking API.** All I/O operations block the calling goroutine. To interact with devices asynchronously, use goroutines, channels, or synchronization primitives. On Linux and Windows, the library does not cancel ongoing I/O operations when the device is closed. On macOS, `Close` unblocks a pending `GetInputReport`, which returns `ErrDeviceIsClosed`.
+- **Report size validation.** `SetOutputReport` and `SetFeatureReport` only reject data longer than the largest report of that type; sizes are not validated per report ID on any platform. On Windows this information is not available at all, since the full report descriptor is not exposed to user space.
 - **Linux device permissions.** Some HID devices require additional permissions. The library does not manage udev rules or group membership.

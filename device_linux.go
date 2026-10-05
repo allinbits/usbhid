@@ -181,14 +181,16 @@ func (d *Device) open(lock bool) error {
 		return err
 	}
 
+	flag := syscall.LOCK_SH
 	if lock {
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-			f.Close()
-			if err == syscall.EWOULDBLOCK {
-				return ErrDeviceLocked
-			}
-			return err
+		flag = syscall.LOCK_EX
+	}
+	if err := syscall.Flock(int(f.Fd()), flag|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if err == syscall.EWOULDBLOCK {
+			return ErrDeviceLocked
 		}
+		return err
 	}
 
 	d.extra.file = f

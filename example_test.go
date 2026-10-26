@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log"
 
-	"rafaelmartins.com/p/usbhid"
+	"github.com/allinbits/usbhid"
 )
 
 func ExampleEnumerate() {

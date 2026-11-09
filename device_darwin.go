@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -80,7 +81,10 @@ type deviceExtra struct {
 	file    _IOHIDDeviceRef
 	options _IOOptionBits
 
-	runloop     _CFRunLoopRef
+	runloop _CFRunLoopRef
+	// closed as soon as the run loop stops: completions can't arrive from then on.
+	loopExited chan struct{}
+	// closed when the run-loop thread is done with the device.
 	runloopDone chan struct{}
 	ioSource    _CFRunLoopSourceRef
 	ioCh        chan func()
@@ -92,6 +96,9 @@ type deviceExtra struct {
 	inputBufferLen _CFIndex
 	inputCh        chan inputCtx
 	callbackHandle uintptr
+
+	// set when a write never got its completion, protected by ioMtx.
+	reportStuck bool
 }
 
 type deviceState uint8
@@ -113,6 +120,10 @@ func (s deviceState) live() bool {
 // ring that hidraw and the windows hid class driver keep in the kernel.
 const inputQueueLength = 64
 
+// reportBackstop is how long after its own timeout iokit may take to deliver
+// the completion of a write, before giving up on it.
+const reportBackstop = time.Second
+
 const (
 	kCFAllocatorDefault _CFAllocatorRef = 0
 
@@ -133,6 +144,7 @@ var (
 	_CFDataGetLength         func(data _CFDataRef) _CFIndex
 	_CFNumberGetValue        func(number _CFNumberRef, theType _CFNumberType, valuePtr unsafe.Pointer) bool
 	_CFRelease               func(cf _CFTypeRef)
+	_CFRetain                func(cf _CFTypeRef) _CFTypeRef
 	_CFRunLoopGetCurrent     func() _CFRunLoopRef
 	_CFRunLoopRunInMode      func(mode _CFStringRef, seconds _CFTimeInterval, returnAfterSourceHandled bool) int32
 	_CFRunLoopStop           func(runLoop _CFRunLoopRef)
@@ -165,6 +177,7 @@ const (
 
 	kIOReturnSuccess         _IOReturn = 0
 	kIOReturnExclusiveAccess _IOReturn = -0x1ffffd3b
+	kIOReturnTimeout         _IOReturn = -0x1ffffd2a
 )
 
 var (
@@ -228,6 +241,7 @@ func init() {
 	purego.RegisterLibFunc(&_CFDataGetLength, cf, "CFDataGetLength")
 	purego.RegisterLibFunc(&_CFNumberGetValue, cf, "CFNumberGetValue")
 	purego.RegisterLibFunc(&_CFRelease, cf, "CFRelease")
+	purego.RegisterLibFunc(&_CFRetain, cf, "CFRetain")
 	purego.RegisterLibFunc(&_CFRunLoopGetCurrent, cf, "CFRunLoopGetCurrent")
 	purego.RegisterLibFunc(&_CFRunLoopRunInMode, cf, "CFRunLoopRunInMode")
 	purego.RegisterLibFunc(&_CFRunLoopStop, cf, "CFRunLoopStop")
@@ -509,7 +523,7 @@ func removalCallback(context uintptr, result _IOReturn, sender uintptr) {
 		// close waits for any asynchronous report completion before stopping
 		// the run loop. stopping it in this callback could prevent that
 		// completion from being delivered and deadlock close on ioMtx.
-		d.close()
+		d.closeSession(context)
 	}()
 }
 
@@ -693,6 +707,7 @@ func (d *Device) open(lock bool) (err error) {
 
 	inputCh := make(chan inputCtx, inputQueueLength)
 	done := make(chan struct{})
+	loopExited := make(chan struct{})
 	runloopDone := make(chan struct{})
 	ioCh := make(chan func(), 1)
 	reportCh := make(chan _IOReturn, 1)
@@ -702,6 +717,7 @@ func (d *Device) open(lock bool) (err error) {
 	d.extra.file = file
 	d.extra.options = options
 	d.extra.runloop = 0
+	d.extra.loopExited = loopExited
 	d.extra.runloopDone = runloopDone
 	d.extra.ioSource = ioSource
 	d.extra.ioCh = ioCh
@@ -715,10 +731,15 @@ func (d *Device) open(lock bool) (err error) {
 	sessionPublished = true
 
 	go func() {
+		// never unlocked: a goroutine that exits locked takes its thread with
+		// it, and the thread's run loop with whatever is still scheduled there.
+		// back in the pool it could be picked up to run a later session.
 		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
 
 		runloop := _CFRunLoopGetCurrent()
+		// the run loop belongs to the thread and goes away with it, and close
+		// may still wake and stop it after this goroutine has exited.
+		_CFRetain(_CFTypeRef(runloop))
 		mode := defaultRunLoopMode()
 		pool := _objc_autoreleasePoolPush()
 		_IOHIDDeviceScheduleWithRunLoop(file, runloop, mode)
@@ -754,8 +775,11 @@ func (d *Device) open(lock bool) (err error) {
 		}
 
 	stopped:
+		// a write waiting for its completion holds ioMtx, taken below. this has
+		// to come first for that write to return.
+		close(loopExited)
+
 		d.extra.stateMtx.Lock()
-		disconnected := d.extra.state == deviceDisconnected
 		unexpectedStop := d.extra.state == deviceOpen || d.extra.state == deviceOpening
 		if unexpectedStop {
 			d.extra.state = deviceRunloopFailed
@@ -769,18 +793,16 @@ func (d *Device) open(lock bool) (err error) {
 		}
 
 		pool = _objc_autoreleasePoolPush()
-		if !disconnected {
-			_IOHIDDeviceRegisterInputReportCallback(file, inputBuffer, inputBufferLen, 0, 0)
-			_IOHIDDeviceRegisterRemovalCallback(file, 0, 0)
-			_IOHIDDeviceUnscheduleFromRunLoop(file, runloop, mode)
-		}
+		_IOHIDDeviceRegisterInputReportCallback(file, inputBuffer, inputBufferLen, 0, 0)
+		_IOHIDDeviceRegisterRemovalCallback(file, 0, 0)
+		_IOHIDDeviceUnscheduleFromRunLoop(file, runloop, mode)
 		_CFRunLoopRemoveSource(runloop, ioSource, mode)
 		_objc_autoreleasePoolPop(pool)
 		close(runloopDone)
 		if unexpectedStop {
 			d.extra.ioMtx.Unlock()
 			go func() {
-				d.close()
+				d.closeSession(callbackContext)
 			}()
 		}
 	}()
@@ -811,6 +833,26 @@ func (d *Device) close() error {
 	d.extra.lifeMtx.Lock()
 	defer d.extra.lifeMtx.Unlock()
 
+	return d.closeLocked()
+}
+
+// closeSession closes the device on behalf of a session that ended on its own.
+// By the time this runs, the caller may have closed that session and opened
+// another one on the same Device, which must be left alone.
+func (d *Device) closeSession(callbackHandle uintptr) {
+	d.extra.lifeMtx.Lock()
+	defer d.extra.lifeMtx.Unlock()
+
+	d.extra.stateMtx.Lock()
+	current := d.extra.callbackHandle
+	d.extra.stateMtx.Unlock()
+
+	if current == callbackHandle {
+		d.closeLocked()
+	}
+}
+
+func (d *Device) closeLocked() error {
 	d.extra.stateMtx.Lock()
 	if d.extra.state == deviceClosed {
 		d.extra.stateMtx.Unlock()
@@ -859,10 +901,10 @@ func (d *Device) close() error {
 	var closeErr error
 	runtime.LockOSThread()
 	pool := _objc_autoreleasePoolPush()
-	if !disconnected {
-		if rv := _IOHIDDeviceClose(file, options); rv != kIOReturnSuccess {
-			closeErr = ioReturnError(rv)
-		}
+	// also needed for a device that is gone: skipping it crashes on macOS 10.15
+	// and later. the outcome doesn't matter in that case.
+	if rv := _IOHIDDeviceClose(file, options); rv != kIOReturnSuccess && !disconnected {
+		closeErr = ioReturnError(rv)
 	}
 	_CFRelease(_CFTypeRef(file))
 	_objc_autoreleasePoolPop(pool)
@@ -877,11 +919,15 @@ func (d *Device) close() error {
 	if callbackHandle != 0 {
 		unregisterCallbackDevice(callbackHandle)
 	}
+	if runloop != 0 {
+		_CFRelease(_CFTypeRef(runloop))
+	}
 
 	d.extra.stateMtx.Lock()
 	d.extra.file = 0
 	d.extra.options = kIOHIDOptionsTypeNone
 	d.extra.runloop = 0
+	d.extra.loopExited = nil
 	d.extra.runloopDone = nil
 	d.extra.ioSource = 0
 	d.extra.ioCh = nil
@@ -891,6 +937,7 @@ func (d *Device) close() error {
 	d.extra.callbackHandle = 0
 	d.extra.state = deviceClosed
 	d.extra.stateMtx.Unlock()
+	d.extra.reportStuck = false
 
 	return closeErr
 }
@@ -936,9 +983,15 @@ func (d *Device) setReport(typ _IOHIDReportType, reportId byte, data []byte) err
 	ioSource := d.extra.ioSource
 	ioCh := d.extra.ioCh
 	reportCh := d.extra.reportCh
-	runloopDone := d.extra.runloopDone
+	loopExited := d.extra.loopExited
 	callbackHandle := d.extra.callbackHandle
 	d.extra.stateMtx.Unlock()
+
+	// iokit still owns the transfer that never completed, and there is a single
+	// completion channel: its completion would be taken for the one of this write.
+	if d.extra.reportStuck {
+		return ErrDeviceTimeout
+	}
 
 	reportLen := len(data)
 	if d.reportWithId {
@@ -977,8 +1030,10 @@ func (d *Device) setReport(typ _IOHIDReportType, reportId byte, data []byte) err
 	default:
 	}
 
-	ioCh <- func() {
-		rv := _IOHIDDeviceSetReportWithCallback(file, typ, _CFIndex(reportId), report, _CFIndex(reportLen), 0, reportCallbackPtr, callbackHandle)
+	timeout := writeTimeout
+
+	op := func() {
+		rv := _IOHIDDeviceSetReportWithCallback(file, typ, _CFIndex(reportId), report, _CFIndex(reportLen), _CFTimeInterval(timeout.Milliseconds()), reportCallbackPtr, callbackHandle)
 		if rv != kIOReturnSuccess {
 			select {
 			case reportCh <- rv:
@@ -986,31 +1041,48 @@ func (d *Device) setReport(typ _IOHIDReportType, reportId byte, data []byte) err
 			}
 		}
 	}
+	select {
+	case ioCh <- op:
+	case <-loopExited:
+		return ErrDeviceIsClosed
+	}
 	_CFRunLoopSourceSignal(ioSource)
 	_CFRunLoopWakeUp(runloop)
+
+	// iokit enforces the timeout, this is for a completion that never comes.
+	backstop := time.NewTimer(timeout + reportBackstop)
+	defer backstop.Stop()
 
 	select {
 	case result := <-reportCh:
 		completed = true
-		if result != kIOReturnSuccess {
-			return ioReturnError(result)
-		}
-		return nil
+		return reportError(result)
 
-	case <-runloopDone:
+	case <-loopExited:
 		// completions are delivered by the run loop, so once it exits none
 		// can arrive anymore.
 		select {
 		case result := <-reportCh:
 			completed = true
-			if result != kIOReturnSuccess {
-				return ioReturnError(result)
-			}
-			return nil
+			return reportError(result)
 		default:
 			return ErrDeviceIsClosed
 		}
+
+	case <-backstop.C:
+		d.extra.reportStuck = true
+		return ErrDeviceTimeout
 	}
+}
+
+func reportError(result _IOReturn) error {
+	switch result {
+	case kIOReturnSuccess:
+		return nil
+	case kIOReturnTimeout:
+		return ErrDeviceTimeout
+	}
+	return ioReturnError(result)
 }
 
 func (d *Device) setOutputReport(reportId byte, data []byte) error {
@@ -1039,6 +1111,9 @@ func (d *Device) getFeatureReport(reportId byte) ([]byte, error) {
 	}
 	l := _CFIndex(len(buf))
 
+	// synchronous and off the run loop on purpose: serialized with the other
+	// report operations by ioMtx, and running it on the run loop would stall
+	// the delivery of input reports for as long as it takes.
 	runtime.LockOSThread()
 	pool := _objc_autoreleasePoolPush()
 	rv := _IOHIDDeviceGetReport(file, kIOHIDReportTypeFeature, _CFIndex(reportId), buf, &l)

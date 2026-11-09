@@ -164,6 +164,10 @@ func (d *Device) GetInputReport() (byte, []byte, error) {
 		return 0, nil, fmt.Errorf("%w [%s]", ErrDeviceIsClosed, d)
 	}
 
+	if d.reportInputLength == 0 {
+		return 0, nil, fmt.Errorf("%w [%s]: device has no input reports", ErrGetInputReportFailed, d)
+	}
+
 	id, buf, err := d.getInputReport()
 	if err != nil {
 		return 0, nil, fmt.Errorf("%w [%s]: %w", ErrGetInputReportFailed, d, err)

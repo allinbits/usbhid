@@ -670,7 +670,7 @@ func (d *Device) open(lock bool) (err error) {
 	}
 	opened = true
 
-	inputBufferLen := _CFIndex(d.reportInputLength + 1)
+	inputBufferLen := _CFIndex(int(d.reportInputLength) + 1)
 	inputBuffer = _CFAllocatorAllocate(systemAllocator(), inputBufferLen, 0)
 	if inputBuffer == nil {
 		return errors.New("failed to allocate input report buffer")
@@ -1033,11 +1033,11 @@ func (d *Device) getFeatureReport(reportId byte) ([]byte, error) {
 	file := d.extra.file
 	d.extra.stateMtx.Unlock()
 
-	buf := make([]byte, d.reportFeatureLength+1)
+	buf := make([]byte, int(d.reportFeatureLength)+1)
 	if d.reportWithId {
 		buf[0] = reportId
 	}
-	l := _CFIndex(d.reportFeatureLength + 1)
+	l := _CFIndex(len(buf))
 
 	runtime.LockOSThread()
 	pool := _objc_autoreleasePoolPush()

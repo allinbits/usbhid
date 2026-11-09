@@ -431,7 +431,7 @@ func (d *Device) close() error {
 
 func (d *Device) getInputReport() (byte, []byte, error) {
 	ovl := overlapped{ev: d.extra.evInput}
-	buf := make([]byte, d.reportInputLength+1)
+	buf := make([]byte, int(d.reportInputLength)+1)
 	if _, err := call(_ReadFile, d.extra.file, unsafe.Pointer(&buf[0]), len(buf), 0, &ovl); err != nil {
 		return 0, nil, err
 	}
@@ -444,7 +444,7 @@ func (d *Device) getInputReport() (byte, []byte, error) {
 func (d *Device) setOutputReport(reportId byte, data []byte) error {
 	// windows expects a buffer of the full report length, even when the report
 	// for this id is shorter.
-	buf := make([]byte, d.reportOutputLength+1)
+	buf := make([]byte, int(d.reportOutputLength)+1)
 	buf[0] = reportId
 	copy(buf[1:], data)
 
@@ -453,7 +453,7 @@ func (d *Device) setOutputReport(reportId byte, data []byte) error {
 }
 
 func (d *Device) getFeatureReport(reportId byte) ([]byte, error) {
-	buf := make([]byte, d.reportFeatureLength+1)
+	buf := make([]byte, int(d.reportFeatureLength)+1)
 	buf[0] = reportId
 
 	n, err := ioctl(d.extra.file, d.extra.evGetFeature, _IOCTL_HID_GET_FEATURE, nil, buf)
@@ -469,7 +469,7 @@ func (d *Device) getFeatureReport(reportId byte) ([]byte, error) {
 func (d *Device) setFeatureReport(reportId byte, data []byte) error {
 	// windows expects a buffer of the full report length, even when the report
 	// for this id is shorter.
-	buf := make([]byte, d.reportFeatureLength+1)
+	buf := make([]byte, int(d.reportFeatureLength)+1)
 	buf[0] = reportId
 	copy(buf[1:], data)
 

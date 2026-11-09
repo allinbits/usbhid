@@ -214,7 +214,7 @@ func (d *Device) close() error {
 }
 
 func (d *Device) getInputReport() (byte, []byte, error) {
-	buflen := d.reportInputLength
+	buflen := int(d.reportInputLength)
 	if d.reportWithId {
 		buflen++
 	}
@@ -239,7 +239,7 @@ func (d *Device) setOutputReport(reportId byte, data []byte) error {
 }
 
 func (d *Device) getFeatureReport(reportId byte) ([]byte, error) {
-	buf := make([]byte, d.reportFeatureLength+1)
+	buf := make([]byte, int(d.reportFeatureLength)+1)
 	if d.reportWithId {
 		buf[0] = reportId
 	}

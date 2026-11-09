@@ -403,3 +403,32 @@ func TestDarwinSynchronousFeatureReportUsesReturnedLength(t *testing.T) {
 		t.Fatalf("feature report length mismatch: %v", report)
 	}
 }
+
+func fakeOpen(d *Device) {
+	d.extra.state = deviceOpen
+	d.extra.done = make(chan struct{})
+}
+
+func TestDarwinFeatureReportOfMaximumLength(t *testing.T) {
+	stubIOKit(t)
+
+	_IOHIDDeviceGetReport = func(_ _IOHIDDeviceRef, _ _IOHIDReportType, _ _CFIndex, report []byte, length *_CFIndex) _IOReturn {
+		if len(report) != 0x10000 {
+			t.Errorf("report buffer has %d bytes", len(report))
+		}
+		copy(report, []byte{4, 8, 9})
+		*length = 3
+		return kIOReturnSuccess
+	}
+
+	d := &Device{reportFeatureLength: 0xffff, reportWithId: true}
+	d.extra.state = deviceOpen
+	d.extra.file = 1
+	report, err := d.getFeatureReport(4)
+	if err != nil {
+		t.Fatalf("get feature report failed: %v", err)
+	}
+	if !bytes.Equal(report, []byte{8, 9}) {
+		t.Fatalf("feature report mismatch: %v", report)
+	}
+}

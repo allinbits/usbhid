@@ -5,6 +5,9 @@
 package usbhid
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"regexp"
@@ -46,4 +49,20 @@ func TestBuildsForIOSWithoutCgo(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build failed: %v\n%s", err, out)
 	}
+}
+
+// syscall.NewLazyDLL searches the application directory first, so a DLL
+// planted next to the executable would run inside the signing process.
+func TestWindowsLoadsSystemLibrariesOnly(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "device_windows.go", nil, 0)
+	if err != nil {
+		t.Skipf("source not available: %v", err)
+	}
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "NewLazyDLL" {
+			t.Errorf("NewLazyDLL can load a library from outside of the system directory")
+		}
+		return true
+	})
 }

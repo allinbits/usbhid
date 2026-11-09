@@ -11,6 +11,7 @@ package usbhid
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // Errors returned from usbhid package may be tested against these errors
@@ -22,6 +23,7 @@ var (
 	ErrDeviceIsClosed          = errors.New("usb hid device is closed")
 	ErrDeviceIsOpen            = errors.New("usb hid device is open")
 	ErrDeviceLocked            = errors.New("usb hid device is locked by another application")
+	ErrDeviceTimeout           = errors.New("usb hid device timed out")
 	ErrGetFeatureReportFailed  = errors.New("get usb hid feature report failed")
 	ErrGetInputReportFailed    = errors.New("get usb hid input report failed")
 	ErrMoreThanOneDeviceFound  = errors.New("more than one usb hid device found")
@@ -30,6 +32,11 @@ var (
 	ErrSetFeatureReportFailed  = errors.New("set usb hid feature report failed")
 	ErrSetOutputReportFailed   = errors.New("set usb hid output report failed")
 )
+
+// writeTimeout bounds how long a write or a feature report may take. A device
+// that stops answering would otherwise hang its caller forever. Reads have no
+// such limit, as a device may legitimately wait for its user: Close cancels them.
+var writeTimeout = 5 * time.Second
 
 // Device is an opaque structure that represents a USB HID device connected
 // to the computer.

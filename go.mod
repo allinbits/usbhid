@@ -1,5 +1,5 @@
 module github.com/allinbits/usbhid
 
-go 1.19
+go 1.25.0
 
-require github.com/ebitengine/purego v0.9.1
+require github.com/ebitengine/purego v0.11.3

@@ -51,7 +51,7 @@ defer device.Close()
 
 ## Requirements
 
-- Go 1.19 or later
+- Go 1.25 or later
 
 ## Explore further
 

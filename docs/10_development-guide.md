@@ -12,7 +12,7 @@ For complete function signatures and type definitions, see the [API documentatio
 go get rafaelmartins.com/p/usbhid
 ```
 
-The module requires Go 1.19 or later. The only external dependency is [purego](https://github.com/ebitengine/purego), used on macOS to call IOKit and CoreFoundation without cgo.
+The module requires Go 1.25 or later. The only external dependency is [purego](https://github.com/ebitengine/purego), used on macOS to call IOKit and CoreFoundation without cgo.
 
 ### Import
 

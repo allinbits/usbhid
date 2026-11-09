@@ -116,7 +116,7 @@ fmt.Printf("Report ID: %d, Data: %x\n", reportId, data)
 > [!NOTE]
 > This call blocks the calling goroutine and has no timeout. To read reports without blocking other work, call it from a dedicated goroutine and communicate results through channels. To cancel it, call `Close` from another goroutine. On a device with no input reports it fails at once with an error matching `ErrGetInputReportFailed`.
 
-Reports that arrive between calls are queued by the operating system, and are lost when the queue overflows: new reports are dropped on Linux and macOS (64 reports), the oldest ones on Windows (32 by default).
+Reports that arrive between calls are queued by the operating system, and are lost when the queue overflows: new reports are dropped on Linux (63 reports) and macOS (64 reports), the oldest ones on Windows (32 by default).
 
 ### Writing output reports
 
@@ -178,6 +178,8 @@ Exclusive locking uses `flock(2)` with `LOCK_EX|LOCK_NB`. It is advisory: applic
 
 The kernel reuses hidraw minors, so `Open` compares the vendor and product behind the node, through `HIDIOCGRAWINFO`, with the enumerated ones, and fails if they differ. The file stays in non-blocking mode and registered with the Go runtime poller, which is what lets `Close` interrupt a read. Write timeouts are the kernel's own, reported as `ErrDeviceTimeout`.
 
+Feature reports go through an ioctl whose size field limits them to 16382 bytes of data, or 8190 on architectures with a 13-bit size field (`mips`, `ppc` and `sparc` families). Longer ones are rejected with an error, even if the device declares them.
+
 The ioctl encoding is architecture-aware and supports: `386`, `amd64`, `arm`, `arm64`, `loong64`, `riscv64`, `s390x`, `mips`, `mips64`, `mips64le`, `mipsle`, `ppc`, `ppc64`, `ppc64le`, and `sparc64`. On any other architecture, the package panics during initialization.
 
 > [!NOTE]
@@ -189,7 +191,7 @@ The macOS backend uses IOKit's HID Manager through [purego](https://github.com/e
 
 A single `IOHIDManager` is created for the process when the package is initialized. Each `Enumerate` call resets its device matching to rebuild the device set, so devices plugged in or removed between calls are picked up. Only devices whose `Transport` property is `USB` are listed.
 
-Each open device has a dedicated goroutine, locked to its OS thread, that runs a CFRunLoop. The thread ends with the session, so a later session never runs on a run loop that served a previous one. Input report and device removal callbacks are delivered on it, and output and feature report writes are dispatched to it, with a 5 second timeout given to IOKit. A write whose completion doesn't come within a second of that returns `ErrDeviceTimeout`, and the session then refuses further writes with the same error, because IOKit still owns that transfer. `Close` waits for a write in flight, so it takes up to about 6 seconds in that case. `GetFeatureReport` is synchronous and runs on the calling thread instead, serialized with the writes, as running it on the run loop would stall input delivery. Input reports that arrive between `GetInputReport` calls are queued, up to 64 reports; when the queue is full, new reports are dropped.
+Each open device has a dedicated goroutine, locked to its OS thread, that runs a CFRunLoop. The thread ends with the session, so a later session never runs on a run loop that served a previous one. Input report and device removal callbacks are delivered on it, and output and feature report writes are dispatched to it, with a 5 second timeout given to IOKit. A write whose completion doesn't come within a second of that returns `ErrDeviceTimeout`, and the session then refuses further writes with the same error, because IOKit still owns that transfer. Its report buffer stays allocated for the life of the process, as IOKit may still write to it. `Close` waits for a write in flight, so it takes up to about 6 seconds in that case. `GetFeatureReport` is synchronous and runs on the calling thread instead, serialized with the writes, as running it on the run loop would stall input delivery. Input reports that arrive between `GetInputReport` calls are queued, up to 64 reports; when the queue is full, new reports are dropped.
 
 When the device is unplugged, the library closes it automatically, and a blocking `GetInputReport` call returns `ErrDeviceIsClosed`. If the run loop stops for any other reason, the session ends in the same way. An automatic close only acts on the session it belongs to, never on a newer one opened on the same `Device`.
 

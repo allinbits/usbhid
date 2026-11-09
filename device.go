@@ -199,8 +199,8 @@ func (d *Device) Close() error {
 // timeout: use Close from another goroutine to cancel it.
 //
 // Reports that arrive between calls are queued by the operating system, and
-// are lost when the queue overflows: new reports are dropped on Linux and
-// macOS (64 reports), the oldest ones on Windows (32 by default).
+// are lost when the queue overflows: new reports are dropped on Linux (63
+// reports) and macOS (64 reports), the oldest ones on Windows (32 by default).
 func (d *Device) GetInputReport() (byte, []byte, error) {
 	if !d.isOpen() {
 		return 0, nil, fmt.Errorf("%w [%s]", ErrDeviceIsClosed, d)

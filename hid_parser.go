@@ -19,9 +19,10 @@ func hidValue(size byte, buf []byte) uint32 {
 }
 
 type hidGlobalState struct {
-	size  uint32
-	id    uint32
-	count uint32
+	usagePage uint32
+	size      uint32
+	id        uint32
+	count     uint32
 }
 
 // maxReportBits is the largest report size that can be represented, as report
@@ -136,13 +137,16 @@ func hidParseReportDescriptor(descriptor []byte) (uint16, uint16, uint16, uint16
 				rcount = hidValue(size, descriptor[i:])
 
 			case 10: // push
-				rstack = append(rstack, hidGlobalState{rsize, rid, rcount})
+				rstack = append(rstack, hidGlobalState{rusagePage, rsize, rid, rcount})
 
 			case 11: // pop
 				if l := len(rstack); l > 0 {
 					g := rstack[l-1]
 					rstack = rstack[:l-1]
 					rsize, rid, rcount = g.size, g.id, g.count
+					if rcollectionl == 0 && !usageSet {
+						rusagePage = g.usagePage
+					}
 				}
 			}
 

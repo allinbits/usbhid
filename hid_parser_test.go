@@ -364,3 +364,28 @@ func TestParseExtendedUsage(t *testing.T) {
 		})
 	}
 }
+
+func TestParsePopRestoresUsagePage(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		descr []byte
+		page  uint16
+	}{
+		{
+			name:  "pop restores the page before a collection",
+			descr: []byte{0x06, 0xA0, 0xFF, 0xA4, 0x05, 0x01, 0xB4, 0x09, 0x01, 0xA1, 0x01, 0xC0},
+			page:  0xffa0,
+		},
+		{
+			name:  "pop inside a collection does not change it",
+			descr: []byte{0x05, 0x01, 0xA4, 0x06, 0xA0, 0xFF, 0x09, 0x01, 0xA1, 0x01, 0xB4, 0xC0},
+			page:  0xffa0,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if page, _, _, _, _, _ := hidParseReportDescriptor(tt.descr); page != tt.page {
+				t.Errorf("got 0x%04x, want 0x%04x", page, tt.page)
+			}
+		})
+	}
+}

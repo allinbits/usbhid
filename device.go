@@ -329,9 +329,10 @@ func (d *Device) SerialNumber() string {
 	return d.serialNumber
 }
 
-// UsagePage returns the usage page of the USB HID device. For a device with
-// several top-level collections it is the one of the first collection, so a
-// later collection's usage page is not visible here.
+// UsagePage returns the usage page of the USB HID device. On Linux and macOS,
+// for a device with several top-level collections it is the one of the first
+// collection, so a later collection's usage page is not visible here. Windows
+// lists each top-level collection as a device of its own.
 func (d *Device) UsagePage() uint16 {
 	return d.usagePage
 }

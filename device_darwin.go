@@ -1122,7 +1122,7 @@ func (d *Device) getFeatureReport(reportId byte) ([]byte, error) {
 	if rv != kIOReturnSuccess {
 		return nil, ioReturnError(rv)
 	}
-	if l < 0 || l > _CFIndex(len(buf)) {
+	if l < 0 || l > _CFIndex(len(buf)) || (d.reportWithId && l < 1) {
 		return nil, fmt.Errorf("invalid report length: %d", l)
 	}
 

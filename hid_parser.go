@@ -58,6 +58,7 @@ func hidParseReportDescriptor(descriptor []byte) (uint16, uint16, uint16, uint16
 		rsize        uint32
 		rusagePage   uint32
 		rusage       uint32
+		rextended    bool
 		rid          uint32
 		rstack       []hidGlobalState
 
@@ -150,11 +151,17 @@ func hidParseReportDescriptor(descriptor []byte) (uint16, uint16, uint16, uint16
 			case 0: // usage
 				if rcollectionl == 0 && !usageSet {
 					rusage = hidValue(size, descriptor[i:])
+					// a 4 byte usage carries its own page in the upper half.
+					rextended = size == 4
 				}
 			}
 		}
 
 		i += int(size)
+	}
+
+	if rextended {
+		rusagePage = rusage >> 16
 	}
 
 	return uint16(rusagePage), uint16(rusage), maxReportLength(input), maxReportLength(output), maxReportLength(feature), withId

@@ -323,3 +323,44 @@ func TestParseMalformedDescriptors(t *testing.T) {
 		})
 	}
 }
+
+func TestParseExtendedUsage(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		descr []byte
+		page  uint16
+		usage uint16
+	}{
+		{
+			name:  "the usage carries the page",
+			descr: []byte{0x05, 0x01, 0x0B, 0x01, 0x00, 0xA0, 0xFF, 0xA1, 0x01},
+			page:  0xffa0,
+			usage: 0x0001,
+		},
+		{
+			name:  "a later usage page does not replace it",
+			descr: []byte{0x0B, 0x01, 0x00, 0xA0, 0xFF, 0x05, 0x01, 0xA1, 0x01},
+			page:  0xffa0,
+			usage: 0x0001,
+		},
+		{
+			name:  "a later short usage uses the usage page",
+			descr: []byte{0x0B, 0x01, 0x00, 0xA0, 0xFF, 0x05, 0x01, 0x09, 0x02, 0xA1, 0x01},
+			page:  0x0001,
+			usage: 0x0002,
+		},
+		{
+			name:  "inside a collection it is ignored",
+			descr: []byte{0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x0B, 0x01, 0x00, 0xA0, 0xFF, 0xC0},
+			page:  0x0001,
+			usage: 0x0006,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			page, usage, _, _, _, _ := hidParseReportDescriptor(tt.descr)
+			if page != tt.page || usage != tt.usage {
+				t.Errorf("got 0x%04x/0x%04x, want 0x%04x/0x%04x", page, usage, tt.page, tt.usage)
+			}
+		})
+	}
+}

@@ -223,3 +223,24 @@ func TestLinuxFeatureReportAfterCloseFails(t *testing.T) {
 		t.Fatalf("got %v, want ErrDeviceIsClosed", err)
 	}
 }
+
+func TestLinuxShortFeatureWriteIsAnError(t *testing.T) {
+	d := newFifoDevice(t)
+	if err := d.Open(false); err != nil {
+		t.Fatalf("open failed: %v", err)
+	}
+	defer d.Close()
+
+	written := 2
+	original := ioctl
+	defer func() { ioctl = original }()
+	ioctl = func(uintptr, uint, unsafe.Pointer) (int, error) { return written, nil }
+
+	if err := d.SetFeatureReport(0, []byte{1, 2}); err == nil {
+		t.Fatal("short write accepted")
+	}
+	written = 3
+	if err := d.SetFeatureReport(0, []byte{1, 2}); err != nil {
+		t.Fatalf("complete write rejected: %v", err)
+	}
+}

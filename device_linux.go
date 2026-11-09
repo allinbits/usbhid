@@ -77,7 +77,7 @@ func ioc(dir byte, typ byte, nr byte, size uint16) uint32 {
 // ioctl takes the argument as a pointer so that it is converted to uintptr in
 // the call to syscall.Syscall, which is what keeps it alive and in place during
 // the call.
-func ioctl(fd uintptr, request uint, arg unsafe.Pointer) (int, error) {
+var ioctl = func(fd uintptr, request uint, arg unsafe.Pointer) (int, error) {
 	for {
 		rv, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(request), uintptr(arg))
 		if errno == syscall.EINTR {
@@ -397,8 +397,18 @@ func (d *Device) setFeatureReport(reportId byte, data []byte) error {
 		return err
 	}
 
-	return d.ioError(control(f, func(fd uintptr) error {
-		_, err := ioctl(fd, req, unsafe.Pointer(&buf[0]))
+	var written int
+	if err := control(f, func(fd uintptr) (err error) {
+		written, err = ioctl(fd, req, unsafe.Pointer(&buf[0]))
 		return err
-	}))
+	}); err != nil {
+		return d.ioError(err)
+	}
+
+	// the count includes the report number, even for descriptors without
+	// report ids.
+	if written != len(buf) {
+		return fmt.Errorf("short write: %d of %d bytes", written, len(buf))
+	}
+	return nil
 }

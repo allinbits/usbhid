@@ -80,7 +80,7 @@ The [`Device`](https://pkg.go.dev/github.com/allinbits/usbhid#Device) struct is 
 
 The report lengths are the size of the largest report of each type, without the report ID byte. Lengths from a descriptor declaring more than 65535 bytes saturate at 65535. On Linux and macOS, reports without IDs in several top-level collections count as one report, so their lengths add up.
 
-`UsagePage()` and `Usage()` describe the first top-level collection. A device with several top-level collections on one interface doesn't show the usage pages of the others.
+On Linux and macOS, `UsagePage()` and `Usage()` describe the first top-level collection, so a device with several top-level collections on one interface doesn't show the usage pages of the others. Windows lists each top-level collection as a device of its own.
 
 The `String()` method returns a human-readable representation including vendor ID, product ID, and available string descriptors.
 
@@ -201,7 +201,7 @@ iOS has no such API. The package builds there, and `Enumerate` returns an error.
 
 The Windows backend uses SetupAPI for device enumeration and `hid.dll` for HID-specific operations. The device list is built from the present device interfaces of the HID class (`HidD_GetHidGuid`), without filtering by transport. Device attributes and capabilities are obtained through `HidD_GetAttributes` and `HidP_GetCaps`. I/O uses overlapped operations through the kernel32 API. All libraries are loaded from the system directory only, so a DLL placed next to the executable is never used.
 
-Writes and feature reports are cancelled after 5 seconds, returning `ErrDeviceTimeout`. `Close` cancels whatever is in flight and waits for it to end before closing any handle. A failure while enumerating, other than reaching the end of the list, is an error rather than a shorter list.
+Writes and feature reports are cancelled after 5 seconds, returning `ErrDeviceTimeout`. `Close` cancels whatever is in flight and waits for it to end before closing any handle. A failure listing the device interfaces, other than reaching the end of the list, is an error rather than a shorter list. A device whose own details can't be read, for example because it has just been removed, is left out of the list.
 
 Windows expects output and feature report buffers of the full report length, so shorter data is zero-padded internally.
 

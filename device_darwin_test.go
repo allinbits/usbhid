@@ -806,3 +806,19 @@ func TestDarwinCloseAfterRunloopThreadExit(t *testing.T) {
 		waitFor(t, "automatic close", func() bool { return deviceState_(d) == deviceClosed })
 	}
 }
+
+func TestDarwinEmptyFeatureReportWithIdIsAnError(t *testing.T) {
+	stubIOKit(t)
+
+	_IOHIDDeviceGetReport = func(_ _IOHIDDeviceRef, _ _IOHIDReportType, _ _CFIndex, _ []byte, length *_CFIndex) _IOReturn {
+		*length = 0
+		return kIOReturnSuccess
+	}
+
+	d := &Device{reportFeatureLength: 8, reportWithId: true}
+	d.extra.state = deviceOpen
+	d.extra.file = 1
+	if _, err := d.getFeatureReport(4); err == nil {
+		t.Fatal("empty report accepted")
+	}
+}

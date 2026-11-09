@@ -5,18 +5,31 @@
 package usbhid
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 )
 
 type deviceExtra struct {
+	// mtx only guards the pointer. os.File is safe for concurrent use, and
+	// closing it makes operations in flight return, so nothing is held during
+	// I/O.
+	mtx  sync.RWMutex
 	file *os.File
+}
+
+// hidrawDevinfo is struct hidraw_devinfo.
+type hidrawDevinfo struct {
+	bustype uint32
+	vendor  int16
+	product int16
 }
 
 const (
@@ -61,12 +74,54 @@ func ioc(dir byte, typ byte, nr byte, size uint16) uint32 {
 	return uint32(dir)<<iocDirShift | uint32(typ)<<iocTypeShift | uint32(nr)<<iocNrShift | uint32(size)<<iocSizeShift
 }
 
-func ioctl(fd uintptr, request uint, arg uintptr) (int, error) {
-	rv, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(request), arg)
-	if errno != 0 {
-		return 0, fmt.Errorf("ioctl failed: 0x%x: %s", request, errno)
+// ioctl takes the argument as a pointer so that it is converted to uintptr in
+// the call to syscall.Syscall, which is what keeps it alive and in place during
+// the call.
+func ioctl(fd uintptr, request uint, arg unsafe.Pointer) (int, error) {
+	for {
+		rv, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(request), uintptr(arg))
+		if errno == syscall.EINTR {
+			continue
+		}
+		if errno != 0 {
+			return 0, fmt.Errorf("ioctl failed: 0x%x: %w", request, errno)
+		}
+		return int(rv), nil
 	}
-	return int(rv), nil
+}
+
+// control runs fn with the file descriptor. Unlike File.Fd, it leaves the file
+// in non-blocking mode and registered with the runtime poller, which is what
+// allows Close to interrupt a read.
+func control(f *os.File, fn func(fd uintptr) error) error {
+	conn, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+
+	var fnErr error
+	if err := conn.Control(func(fd uintptr) { fnErr = fn(fd) }); err != nil {
+		return err
+	}
+	return fnErr
+}
+
+var hidrawGetInfo = func(f *os.File) (hidrawDevinfo, error) {
+	var info hidrawDevinfo
+	err := control(f, func(fd uintptr) error {
+		_, err := ioctl(fd, uint(ioc(iocRead, 'H', 0x03, uint16(unsafe.Sizeof(info)))), unsafe.Pointer(&info))
+		return err
+	})
+	return info, err
+}
+
+// featureRequest encodes a feature report ioctl for a buffer of the given
+// length, which has to fit the size field of the request.
+func featureRequest(nr byte, length int) (uint, error) {
+	if length >= 1<<iocSizeBits {
+		return 0, fmt.Errorf("report too long for ioctl: %d bytes", length)
+	}
+	return uint(ioc(iocWrite|iocRead, 'H', nr, uint16(length))), nil
 }
 
 func sysfsReadAsBytes(dir string, entry string) ([]byte, error) {
@@ -181,39 +236,90 @@ func (d *Device) open(lock bool) error {
 		return err
 	}
 
+	if err := d.prepare(f, lock); err != nil {
+		f.Close()
+		return err
+	}
+
+	d.extra.mtx.Lock()
+	defer d.extra.mtx.Unlock()
+
+	if d.extra.file != nil {
+		f.Close()
+		return ErrDeviceIsOpen
+	}
+	d.extra.file = f
+	return nil
+}
+
+func (d *Device) prepare(f *os.File, lock bool) error {
 	flag := syscall.LOCK_SH
 	if lock {
 		flag = syscall.LOCK_EX
 	}
-	if err := syscall.Flock(int(f.Fd()), flag|syscall.LOCK_NB); err != nil {
-		f.Close()
+	if err := control(f, func(fd uintptr) error {
+		return syscall.Flock(int(fd), flag|syscall.LOCK_NB)
+	}); err != nil {
 		if err == syscall.EWOULDBLOCK {
 			return ErrDeviceLocked
 		}
 		return err
 	}
 
-	d.extra.file = f
+	// the kernel reuses hidraw minors: the device may have been replaced at
+	// this path since it was enumerated.
+	info, err := hidrawGetInfo(f)
+	if err != nil {
+		return err
+	}
+	if uint16(info.vendor) != d.vendorId || uint16(info.product) != d.productId {
+		return fmt.Errorf("%s is now a different device: vid=0x%04x; pid=0x%04x", d.path, uint16(info.vendor), uint16(info.product))
+	}
 	return nil
+}
+
+func (d *Device) handle() *os.File {
+	d.extra.mtx.RLock()
+	defer d.extra.mtx.RUnlock()
+	return d.extra.file
 }
 
 func (d *Device) isOpen() bool {
-	return d.extra.file != nil
+	return d.handle() != nil
 }
 
 func (d *Device) close() error {
-	if d.extra.file == nil {
-		return nil
-	}
-
-	if err := d.extra.file.Close(); err != nil {
-		return err
-	}
+	d.extra.mtx.Lock()
+	f := d.extra.file
 	d.extra.file = nil
-	return nil
+	d.extra.mtx.Unlock()
+
+	if f == nil {
+		return ErrDeviceIsClosed
+	}
+	return f.Close()
+}
+
+// ioError translates the errors that have a meaning of their own. Errors from
+// RawConn.Control don't match os.ErrClosed, hence the check of the state.
+func (d *Device) ioError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, os.ErrClosed) || !d.isOpen():
+		return ErrDeviceIsClosed
+	case errors.Is(err, syscall.ETIMEDOUT):
+		return ErrDeviceTimeout
+	}
+	return err
 }
 
 func (d *Device) getInputReport() (byte, []byte, error) {
+	f := d.handle()
+	if f == nil {
+		return 0, nil, ErrDeviceIsClosed
+	}
+
 	buflen := int(d.reportInputLength)
 	if d.reportWithId {
 		buflen++
@@ -221,32 +327,53 @@ func (d *Device) getInputReport() (byte, []byte, error) {
 
 	buf := make([]byte, buflen)
 
-	n, err := d.extra.file.Read(buf)
+	n, err := f.Read(buf)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, d.ioError(err)
 	}
 
 	if d.reportWithId {
+		if n < 1 {
+			return 0, nil, fmt.Errorf("invalid report length: %d", n)
+		}
 		return buf[0], buf[1:n], nil
 	}
 	return 0, buf[:n], nil
 }
 
 func (d *Device) setOutputReport(reportId byte, data []byte) error {
+	f := d.handle()
+	if f == nil {
+		return ErrDeviceIsClosed
+	}
+
 	buf := append([]byte{reportId}, data...)
-	_, err := d.extra.file.Write(buf)
-	return err
+	_, err := f.Write(buf)
+	return d.ioError(err)
 }
 
 func (d *Device) getFeatureReport(reportId byte) ([]byte, error) {
+	f := d.handle()
+	if f == nil {
+		return nil, ErrDeviceIsClosed
+	}
+
 	buf := make([]byte, int(d.reportFeatureLength)+1)
 	if d.reportWithId {
 		buf[0] = reportId
 	}
 
-	rv, err := ioctl(d.extra.file.Fd(), uint(ioc(iocWrite|iocRead, 'H', 0x07, uint16(len(buf)))), uintptr(unsafe.Pointer(&buf[0])))
+	req, err := featureRequest(0x07, len(buf))
 	if err != nil {
 		return nil, err
+	}
+
+	var rv int
+	if err := control(f, func(fd uintptr) (err error) {
+		rv, err = ioctl(fd, req, unsafe.Pointer(&buf[0]))
+		return err
+	}); err != nil {
+		return nil, d.ioError(err)
 	}
 
 	// hidraw always stores the report number in the first byte and counts it
@@ -258,7 +385,20 @@ func (d *Device) getFeatureReport(reportId byte) ([]byte, error) {
 }
 
 func (d *Device) setFeatureReport(reportId byte, data []byte) error {
+	f := d.handle()
+	if f == nil {
+		return ErrDeviceIsClosed
+	}
+
 	buf := append([]byte{reportId}, data...)
-	_, err := ioctl(d.extra.file.Fd(), uint(ioc(iocWrite|iocRead, 'H', 0x06, uint16(len(buf)))), uintptr(unsafe.Pointer(&buf[0])))
-	return err
+
+	req, err := featureRequest(0x06, len(buf))
+	if err != nil {
+		return err
+	}
+
+	return d.ioError(control(f, func(fd uintptr) error {
+		_, err := ioctl(fd, req, unsafe.Pointer(&buf[0]))
+		return err
+	}))
 }

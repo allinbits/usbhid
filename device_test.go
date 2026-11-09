@@ -33,3 +33,27 @@ func TestGetInputReportWithoutInputReports(t *testing.T) {
 		t.Fatal("blocked waiting for a report that can never arrive")
 	}
 }
+
+func TestEnumerateIsSortedByPath(t *testing.T) {
+	original := enumerateDevices
+	defer func() { enumerateDevices = original }()
+	enumerateDevices = func() ([]*Device, error) {
+		return []*Device{{path: "c"}, {path: "a", vendorId: 1}, {path: "b"}}, nil
+	}
+
+	devices, err := Enumerate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 3 || devices[0].path != "a" || devices[1].path != "b" || devices[2].path != "c" {
+		t.Fatalf("not sorted: %v", devices)
+	}
+
+	devices, err = Enumerate(func(d *Device) bool { return d.path != "b" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 2 || devices[0].path != "a" || devices[1].path != "c" {
+		t.Fatalf("filtered list not sorted: %v", devices)
+	}
+}

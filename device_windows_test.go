@@ -293,3 +293,9 @@ func TestWindowsReopenAfterClose(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestWindowsHiddAttributesSize(t *testing.T) {
+	if got := newHiddAttributes().size; got != 12 {
+		t.Fatalf("size is %d, want 12", got)
+	}
+}

@@ -332,6 +332,10 @@ func reportLength(byteLength uint16) uint16 {
 	return byteLength - 1
 }
 
+func newHiddAttributes() _HIDD_ATTRIBUTES {
+	return _HIDD_ATTRIBUTES{size: uint32(unsafe.Sizeof(_HIDD_ATTRIBUTES{}))}
+}
+
 // validDetailSize checks a size for SP_DEVICE_INTERFACE_DETAIL_DATA_W returned
 // by setupapi: the 4 bytes of cbSize, a path of at least one character, and its
 // terminator.
@@ -398,7 +402,7 @@ func enumerate() ([]*Device, error) {
 			}
 			defer call(_CloseHandle, f)
 
-			attr := _HIDD_ATTRIBUTES{}
+			attr := newHiddAttributes()
 			if _, err := call(_HidD_GetAttributes, f, unsafe.Pointer(&attr)); err != nil {
 				return nil
 			}

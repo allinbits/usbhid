@@ -106,6 +106,40 @@ func control(f *os.File, fn func(fd uintptr) error) error {
 	return fnErr
 }
 
+// writeSyscall is a variable for tests to replace.
+var writeSyscall = syscall.Write
+
+// writeOnce writes in a single system call. File.Write would send what is left
+// of a short write as if it were another report.
+func writeOnce(f *os.File, buf []byte) error {
+	conn, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+
+	var (
+		n        int
+		writeErr error
+	)
+	if err := conn.Write(func(fd uintptr) bool {
+		for {
+			n, writeErr = writeSyscall(int(fd), buf)
+			if writeErr != syscall.EINTR {
+				return writeErr != syscall.EAGAIN
+			}
+		}
+	}); err != nil {
+		return err
+	}
+	if writeErr != nil {
+		return writeErr
+	}
+	if n != len(buf) {
+		return fmt.Errorf("short write: %d of %d bytes", n, len(buf))
+	}
+	return nil
+}
+
 var hidrawGetInfo = func(f *os.File) (hidrawDevinfo, error) {
 	var info hidrawDevinfo
 	err := control(f, func(fd uintptr) error {
@@ -347,9 +381,7 @@ func (d *Device) setOutputReport(reportId byte, data []byte) error {
 		return ErrDeviceIsClosed
 	}
 
-	buf := append([]byte{reportId}, data...)
-	_, err := f.Write(buf)
-	return d.ioError(err)
+	return d.ioError(writeOnce(f, append([]byte{reportId}, data...)))
 }
 
 func (d *Device) getFeatureReport(reportId byte) ([]byte, error) {

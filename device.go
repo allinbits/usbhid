@@ -181,7 +181,8 @@ func (d *Device) IsOpen() bool {
 // Close closes the USB HID device, and makes a pending GetInputReport return
 // ErrDeviceIsClosed. A write or feature report in flight may finish with its
 // own result. On macOS Close waits for a write in flight to end first, for up
-// to about 6 seconds.
+// to about 6 seconds. On Windows it waits for operations it cancelled, which
+// takes as long as the driver takes to honor the cancellation.
 func (d *Device) Close() error {
 	if !d.isOpen() {
 		return fmt.Errorf("%w [%s]", ErrDeviceIsClosed, d)
@@ -222,7 +223,8 @@ func (d *Device) GetInputReport() (byte, []byte, error) {
 // and returns an error or nil. If the slice is bigger than the expected
 // report size, an error is returned. Any padding required by the operating
 // system is handled internally. It fails with an error matching
-// ErrDeviceTimeout if the device doesn't accept the report in about 5 seconds.
+// ErrDeviceTimeout if the device doesn't accept the report in about 5 seconds,
+// which on Windows relies on the driver honoring the cancellation.
 func (d *Device) SetOutputReport(reportId byte, data []byte) error {
 	if !d.isOpen() {
 		return fmt.Errorf("%w [%s]", ErrDeviceIsClosed, d)
@@ -259,7 +261,8 @@ func (d *Device) GetFeatureReport(reportId byte) ([]byte, error) {
 // and returns an error or nil. If the slice is bigger than the expected
 // report size, an error is returned. Any padding required by the operating
 // system is handled internally. It fails with an error matching
-// ErrDeviceTimeout if the device doesn't accept the report in about 5 seconds.
+// ErrDeviceTimeout if the device doesn't accept the report in about 5 seconds,
+// which on Windows relies on the driver honoring the cancellation.
 func (d *Device) SetFeatureReport(reportId byte, data []byte) error {
 	if !d.isOpen() {
 		return fmt.Errorf("%w [%s]", ErrDeviceIsClosed, d)

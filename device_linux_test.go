@@ -244,3 +244,45 @@ func TestLinuxShortFeatureWriteIsAnError(t *testing.T) {
 		t.Fatalf("complete write rejected: %v", err)
 	}
 }
+
+func TestLinuxOutputReportReachesTheDevice(t *testing.T) {
+	d := newFifoDevice(t)
+	if err := d.Open(false); err != nil {
+		t.Fatalf("open failed: %v", err)
+	}
+	defer d.Close()
+
+	if err := d.SetOutputReport(7, []byte{1, 2}); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+	_, report, err := d.GetInputReport()
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if !bytes.Equal(report, []byte{7, 1, 2}) {
+		t.Fatalf("got %v", report)
+	}
+}
+
+func TestLinuxShortOutputWriteIsNotContinued(t *testing.T) {
+	d := newFifoDevice(t)
+	if err := d.Open(false); err != nil {
+		t.Fatalf("open failed: %v", err)
+	}
+	defer d.Close()
+
+	calls := 0
+	original := writeSyscall
+	defer func() { writeSyscall = original }()
+	writeSyscall = func(int, []byte) (int, error) {
+		calls++
+		return 2, nil
+	}
+
+	if err := d.SetOutputReport(0, []byte{1, 2, 3}); err == nil {
+		t.Fatal("short write accepted")
+	}
+	if calls != 1 {
+		t.Fatalf("%d write calls: the rest would reach the device as another report", calls)
+	}
+}

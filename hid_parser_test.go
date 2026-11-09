@@ -214,3 +214,178 @@ func TestParse(t *testing.T) {
 		}
 	}
 }
+
+func TestParseLedgerDescriptors(t *testing.T) {
+	report := []byte{
+		0x09, 0x01, // UsageId(1)
+		0xA1, 0x01, // Collection(Application)
+		0x09, 0x03, //     UsageId(3)
+		0x15, 0x00, //     LogicalMinimum(0)
+		0x26, 0xFF, 0x00, // LogicalMaximum(255)
+		0x75, 0x08, //     ReportSize(8)
+		0x95, 0x40, //     ReportCount(64)
+		0x81, 0x08, //     Input
+		0x09, 0x04, //     UsageId(4)
+		0x15, 0x00, //     LogicalMinimum(0)
+		0x26, 0xFF, 0x00, // LogicalMaximum(255)
+		0x75, 0x08, //     ReportSize(8)
+		0x95, 0x40, //     ReportCount(64)
+		0x91, 0x08, //     Output
+		0xC0, // EndCollection()
+	}
+
+	for _, tt := range []struct {
+		name string
+		page []byte
+		want uint16
+	}{
+		{"apdu", []byte{0x06, 0xA0, 0xFF}, 0xffa0},
+		{"fido", []byte{0x06, 0xD0, 0xF1}, 0xf1d0},
+	} {
+		page, usage, input, output, feature, withId := hidParseReportDescriptor(append(append([]byte{}, tt.page...), report...))
+		if page != tt.want || usage != 1 || input != 64 || output != 64 || feature != 0 || withId {
+			t.Errorf("%s: got page=0x%04x usage=%d input=%d output=%d feature=%d withId=%v", tt.name, page, usage, input, output, feature, withId)
+		}
+	}
+}
+
+func TestParseMalformedDescriptors(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		descr []byte
+		page  uint16
+		input uint16
+	}{
+		{
+			name:  "count times size wraps to zero in 32 bits",
+			descr: []byte{0x97, 0x00, 0x00, 0x00, 0x80, 0x77, 0x02, 0x00, 0x00, 0x00, 0x81, 0x00},
+			input: 0xffff,
+		},
+		{
+			name:  "maximum bit count",
+			descr: []byte{0x97, 0xFF, 0xFF, 0xFF, 0xFF, 0x75, 0x01, 0x81, 0x00},
+			input: 0xffff,
+		},
+		{
+			name:  "large count times large size",
+			descr: []byte{0x97, 0x00, 0x00, 0x01, 0x00, 0x77, 0x00, 0x00, 0x08, 0x00, 0x81, 0x00},
+			input: 0xffff,
+		},
+		{
+			name:  "largest length that fits",
+			descr: []byte{0x96, 0xFF, 0xFF, 0x75, 0x08, 0x81, 0x00},
+			input: 0xffff,
+		},
+		{
+			name:  "one byte over the largest length",
+			descr: []byte{0x97, 0x00, 0x00, 0x01, 0x00, 0x75, 0x08, 0x81, 0x00},
+			input: 0xffff,
+		},
+		{
+			name: "length accumulated over several items",
+			descr: []byte{
+				0x96, 0xFF, 0xFF, 0x75, 0x08, 0x81, 0x00,
+				0x96, 0xFF, 0xFF, 0x75, 0x08, 0x81, 0x00,
+			},
+			input: 0xffff,
+		},
+		{
+			name:  "usage page wider than 16 bits",
+			descr: []byte{0x07, 0xA0, 0xFF, 0x01, 0x00},
+		},
+		{
+			name:  "usage page wider than 16 bits keeps the previous one",
+			descr: []byte{0x05, 0x01, 0x07, 0xA0, 0xFF, 0x01, 0x00},
+			page:  0x0001,
+		},
+		{
+			name:  "end collection without a collection",
+			descr: []byte{0xC0, 0x05, 0x01, 0xA1, 0x01, 0x06, 0xA0, 0xFF, 0xA1, 0x01, 0xC0, 0xC0},
+			page:  0x0001,
+		},
+		{
+			name: "report ids are 8 bits wide",
+			descr: []byte{
+				0x85, 0x01, 0x95, 0x01, 0x75, 0x08, 0x81, 0x00,
+				0x86, 0x01, 0x01, 0x95, 0x02, 0x75, 0x08, 0x81, 0x00,
+			},
+			input: 3,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			page, _, input, _, _, _ := hidParseReportDescriptor(tt.descr)
+			if page != tt.page {
+				t.Errorf("usage page: got 0x%04x, want 0x%04x", page, tt.page)
+			}
+			if input != tt.input {
+				t.Errorf("input length: got %d, want %d", input, tt.input)
+			}
+		})
+	}
+}
+
+func TestParseExtendedUsage(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		descr []byte
+		page  uint16
+		usage uint16
+	}{
+		{
+			name:  "the usage carries the page",
+			descr: []byte{0x05, 0x01, 0x0B, 0x01, 0x00, 0xA0, 0xFF, 0xA1, 0x01},
+			page:  0xffa0,
+			usage: 0x0001,
+		},
+		{
+			name:  "a later usage page does not replace it",
+			descr: []byte{0x0B, 0x01, 0x00, 0xA0, 0xFF, 0x05, 0x01, 0xA1, 0x01},
+			page:  0xffa0,
+			usage: 0x0001,
+		},
+		{
+			name:  "a later short usage uses the usage page",
+			descr: []byte{0x0B, 0x01, 0x00, 0xA0, 0xFF, 0x05, 0x01, 0x09, 0x02, 0xA1, 0x01},
+			page:  0x0001,
+			usage: 0x0002,
+		},
+		{
+			name:  "inside a collection it is ignored",
+			descr: []byte{0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x0B, 0x01, 0x00, 0xA0, 0xFF, 0xC0},
+			page:  0x0001,
+			usage: 0x0006,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			page, usage, _, _, _, _ := hidParseReportDescriptor(tt.descr)
+			if page != tt.page || usage != tt.usage {
+				t.Errorf("got 0x%04x/0x%04x, want 0x%04x/0x%04x", page, usage, tt.page, tt.usage)
+			}
+		})
+	}
+}
+
+func TestParsePopRestoresUsagePage(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		descr []byte
+		page  uint16
+	}{
+		{
+			name:  "pop restores the page before a collection",
+			descr: []byte{0x06, 0xA0, 0xFF, 0xA4, 0x05, 0x01, 0xB4, 0x09, 0x01, 0xA1, 0x01, 0xC0},
+			page:  0xffa0,
+		},
+		{
+			name:  "pop inside a collection does not change it",
+			descr: []byte{0x05, 0x01, 0xA4, 0x06, 0xA0, 0xFF, 0x09, 0x01, 0xA1, 0x01, 0xB4, 0xC0},
+			page:  0xffa0,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if page, _, _, _, _, _ := hidParseReportDescriptor(tt.descr); page != tt.page {
+				t.Errorf("got 0x%04x, want 0x%04x", page, tt.page)
+			}
+		})
+	}
+}

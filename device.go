@@ -6,11 +6,24 @@
 // devices connected to a computer, from userspace.
 //
 // It is written in pure Go and works on Linux, macOS and Windows.
+//
+// # Concurrency
+//
+// Close may be called while other operations are in flight. A pending
+// GetInputReport returns an error matching ErrDeviceIsClosed, which makes Close
+// the way to cancel it, as it otherwise blocks until the device sends a report.
+// A write or feature report in flight may instead finish with its own result.
+// Operations started after Close fail with ErrDeviceIsClosed. Reads and writes
+// may run in different goroutines. Calls of the same kind, such as two concurrent
+// GetInputReport calls, must not overlap. Open must not overlap any other call
+// on the same Device.
 package usbhid
 
 import (
 	"errors"
 	"fmt"
+	"sort"
+	"time"
 )
 
 // Errors returned from usbhid package may be tested against these errors
@@ -22,6 +35,7 @@ var (
 	ErrDeviceIsClosed          = errors.New("usb hid device is closed")
 	ErrDeviceIsOpen            = errors.New("usb hid device is open")
 	ErrDeviceLocked            = errors.New("usb hid device is locked by another application")
+	ErrDeviceTimeout           = errors.New("usb hid device timed out")
 	ErrGetFeatureReportFailed  = errors.New("get usb hid feature report failed")
 	ErrGetInputReportFailed    = errors.New("get usb hid input report failed")
 	ErrMoreThanOneDeviceFound  = errors.New("more than one usb hid device found")
@@ -30,6 +44,14 @@ var (
 	ErrSetFeatureReportFailed  = errors.New("set usb hid feature report failed")
 	ErrSetOutputReportFailed   = errors.New("set usb hid output report failed")
 )
+
+// enumerateDevices is a variable for tests to replace.
+var enumerateDevices = enumerate
+
+// writeTimeout bounds how long a write or a feature report may take. A device
+// that stops answering would otherwise hang its caller forever. Reads have no
+// such limit, as a device may legitimately wait for its user: Close cancels them.
+var writeTimeout = 5 * time.Second
 
 // Device is an opaque structure that represents a USB HID device connected
 // to the computer.
@@ -57,12 +79,18 @@ type Device struct {
 type DeviceFilterFunc func(*Device) bool
 
 // Enumerate lists the USB HID devices connected to the computer, optionally
-// filtered by a DeviceFilterFunc function.
+// filtered by a DeviceFilterFunc function. The devices are sorted by path, so
+// the order is the same between calls for as long as the same devices are
+// connected. It says nothing about which device was connected first.
 func Enumerate(f DeviceFilterFunc) ([]*Device, error) {
-	devices, err := enumerate()
+	devices, err := enumerateDevices()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrDeviceEnumerationFailed, err)
 	}
+
+	sort.Slice(devices, func(i, j int) bool {
+		return devices[i].path < devices[j].path
+	})
 
 	if f == nil {
 		return devices, nil
@@ -122,6 +150,12 @@ func (d *Device) String() string {
 }
 
 // Open opens the USB HID device for usage.
+//
+// If lock is true, the device is opened for exclusive access. macOS and Windows
+// enforce it against every other application. On Linux it is an advisory
+// flock(2), which only applications taking the same lock respect: hidapi users
+// such as Ledger Wallet ignore it, and then both applications receive every
+// input report.
 func (d *Device) Open(lock bool) error {
 	if d.isOpen() {
 		return fmt.Errorf("%w [%s]", ErrDeviceIsOpen, d)
@@ -144,7 +178,11 @@ func (d *Device) IsOpen() bool {
 	return d.isOpen()
 }
 
-// Close closes the USB HID device
+// Close closes the USB HID device, and makes a pending GetInputReport return
+// ErrDeviceIsClosed. A write or feature report in flight may finish with its
+// own result. On macOS Close waits for a write in flight to end first, for up
+// to about 6 seconds. On Windows it waits for operations it cancelled, which
+// takes as long as the driver takes to honor the cancellation.
 func (d *Device) Close() error {
 	if !d.isOpen() {
 		return fmt.Errorf("%w [%s]", ErrDeviceIsClosed, d)
@@ -158,10 +196,19 @@ func (d *Device) Close() error {
 
 // GetInputReport reads an input report from the USB HID device.
 // It will block until a report is available, and returns the report id,
-// a slice of bytes with the report content, and an error (or nil).
+// a slice of bytes with the report content, and an error (or nil). There is no
+// timeout: use Close from another goroutine to cancel it.
+//
+// Reports that arrive between calls are queued by the operating system, and
+// are lost when the queue overflows: new reports are dropped on Linux (63
+// reports) and macOS (64 reports), the oldest ones on Windows (32 by default).
 func (d *Device) GetInputReport() (byte, []byte, error) {
 	if !d.isOpen() {
 		return 0, nil, fmt.Errorf("%w [%s]", ErrDeviceIsClosed, d)
+	}
+
+	if d.reportInputLength == 0 {
+		return 0, nil, fmt.Errorf("%w [%s]: device has no input reports", ErrGetInputReportFailed, d)
 	}
 
 	id, buf, err := d.getInputReport()
@@ -175,7 +222,9 @@ func (d *Device) GetInputReport() (byte, []byte, error) {
 // It takes the report id and a slice of bytes with the data to be sent,
 // and returns an error or nil. If the slice is bigger than the expected
 // report size, an error is returned. Any padding required by the operating
-// system is handled internally.
+// system is handled internally. It fails with an error matching
+// ErrDeviceTimeout if the device doesn't accept the report in about 5 seconds,
+// which on Windows relies on the driver honoring the cancellation.
 func (d *Device) SetOutputReport(reportId byte, data []byte) error {
 	if !d.isOpen() {
 		return fmt.Errorf("%w [%s]", ErrDeviceIsClosed, d)
@@ -211,7 +260,9 @@ func (d *Device) GetFeatureReport(reportId byte) ([]byte, error) {
 // It takes the report id and a slice of bytes with the data to be sent,
 // and returns an error or nil. If the slice is bigger than the expected
 // report size, an error is returned. Any padding required by the operating
-// system is handled internally.
+// system is handled internally. It fails with an error matching
+// ErrDeviceTimeout if the device doesn't accept the report in about 5 seconds,
+// which on Windows relies on the driver honoring the cancellation.
 func (d *Device) SetFeatureReport(reportId byte, data []byte) error {
 	if !d.isOpen() {
 		return fmt.Errorf("%w [%s]", ErrDeviceIsClosed, d)
@@ -281,7 +332,10 @@ func (d *Device) SerialNumber() string {
 	return d.serialNumber
 }
 
-// UsagePage returns the usage page of the USB HID device.
+// UsagePage returns the usage page of the USB HID device. On Linux and macOS,
+// for a device with several top-level collections it is the one of the first
+// collection, so a later collection's usage page is not visible here. Windows
+// lists each top-level collection as a device of its own.
 func (d *Device) UsagePage() uint16 {
 	return d.usagePage
 }

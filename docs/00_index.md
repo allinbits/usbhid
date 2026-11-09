@@ -15,7 +15,7 @@ The library is written in pure Go with no cgo dependency. On Linux, it accesses 
 - **Cross-platform** -- supports Linux, macOS, and Windows with platform-native backends
 - **All HID report types** -- read/write input, output, and feature reports
 - **Device filtering** -- enumerate and select devices by vendor ID, product ID, usage page, or any device property
-- **Exclusive locking** -- optional per-device locking to prevent concurrent access from other applications
+- **Exclusive locking** -- optional per-device locking to prevent concurrent access from other applications, enforced on macOS and Windows and advisory on Linux
 - **BSD 3-Clause license** -- permissive open-source licensing
 
 ## Usage
@@ -51,10 +51,10 @@ defer device.Close()
 
 ## Requirements
 
-- Go 1.19 or later
+- Go 1.25 or later
 
 ## Explore further
 
 - [Development guide](10_development-guide.md) -- integration, API overview, and platform details
-- [API documentation](https://pkg.go.dev/rafaelmartins.com/p/usbhid) -- complete API reference on pkg.go.dev
-- [Source code](https://git.rafaelmartins.com/rafaelmartins/usbhid) -- Git repository
+- [API documentation](https://pkg.go.dev/github.com/allinbits/usbhid) -- complete API reference on pkg.go.dev
+- [Source code](https://github.com/allinbits/usbhid) -- Git repository
